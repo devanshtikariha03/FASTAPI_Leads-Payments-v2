@@ -2,5 +2,6 @@ fastapi
 uvicorn[standard]
 python-dotenv
 supabase
-PyJWT
-slowapi
+pyjwt
+postgrest
+email-validator
