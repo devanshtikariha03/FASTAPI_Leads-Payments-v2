@@ -38,7 +38,7 @@
 
 # app/routers/payments.py
 
-from fastapi import APIRouter, Depends, HTTPException, Body
+from fastapi import APIRouter, Depends, HTTPException, Body, status
 from pydantic import BaseModel, Field, conint, validator
 from typing import List, Literal
 from postgrest import APIError
@@ -49,6 +49,7 @@ from ._schemas import ErrorResponse
 
 router = APIRouter(prefix="/api/v2/payments", tags=["payments"])
 
+MAX_PAYMENTS = 50
 
 class Payment(BaseModel):
     date: str = Field(
@@ -69,10 +70,8 @@ class Payment(BaseModel):
             raise ValueError("date must be two dates separated by ' - '")
         return v
 
-
 class PaymentsRequest(BaseModel):
     payments: List[Payment] = Field(..., min_items=1)
-
 
 @router.post(
     "",
@@ -121,7 +120,7 @@ class PaymentsRequest(BaseModel):
             "description": "Payload too large or too many records",
             "content": {
                 "application/json": {
-                    "example": {"error": "Payments API accepts 1–50 records per request"}
+                    "example": {"error": "Payments API accepts 1 to 50 records per request"}
                 }
             },
         },
@@ -140,16 +139,20 @@ def create_payments(
     body: PaymentsRequest = Body(...),
     token=Depends(verify_jwt_token)
 ):
-    if not body.payments:
-        raise HTTPException(status_code=400, detail="Request body cannot be empty")
+    count = len(body.payments)
+    if count < 1 or count > MAX_PAYMENTS:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail="Payments API accepts 1 to 50 records per request"
+        )
 
     records = [p.dict(by_alias=True) for p in body.payments]
     try:
         resp = supabase.from_("payments").insert(records).execute()
     except APIError as e:
-        if getattr(e, "code", "") == "23505" or "duplicate key" in e.message.lower():
-            raise HTTPException(status_code=409, detail="Duplicate payment record")
-        raise HTTPException(status_code=500, detail="Internal server error")
+        if getattr(e, "code", "") == "23505" or "duplicate key" in (e.message or "").lower():
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Duplicate payment record")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Internal server error")
 
     return {"success": True, "inserted": len(resp.data)}
 
