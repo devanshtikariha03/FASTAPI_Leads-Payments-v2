@@ -62,7 +62,7 @@
 
 # app/routers/leads.py
 
-from fastapi import APIRouter, Depends, HTTPException, status, Body
+from fastapi import APIRouter, Depends, HTTPException, Body, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, EmailStr, conint, validator
 from typing import List, Optional, Literal
@@ -74,15 +74,16 @@ from ._schemas import ErrorResponse
 
 router = APIRouter(prefix="/api/v2/leads", tags=["leads"])
 
+MAX_LEADS = 100
 
 class Lead(BaseModel):
     date: str = Field(
         ...,
         pattern=r'^\d{4}-\d{2}-\d{2}\s*-\s*\d{4}-\d{2}-\d{2}$',
-        description="DATERANGE in format YYYY-MM-DD - YYYY-MM-DD"
+        description="DATERANGE YYYY-MM-DD - YYYY-MM-DD"
     )
     realid: str = Field(..., min_length=1)
-    name: str = Field(..., min_length=1)
+    name:   str = Field(..., min_length=1)
     phone_1: conint(ge=1_000_000_000, le=9_999_999_999)
     phone_2: Optional[conint(ge=1_000_000_000, le=9_999_999_999)] = None
     email: Optional[EmailStr] = None
@@ -111,10 +112,9 @@ class Lead(BaseModel):
             raise ValueError('due_date must be after bill_date')
         return v
 
-
 class LeadsRequest(BaseModel):
+    # only min_items enforced here—max handled manually
     leads: List[Lead] = Field(..., min_items=1)
-
 
 @router.post(
     "",
@@ -163,7 +163,7 @@ class LeadsRequest(BaseModel):
             "description": "Payload too large or too many records",
             "content": {
                 "application/json": {
-                    "example": {"error": "Leads API accepts 1–100 records per request"}
+                    "example": {"error": "Leads API accepts 1 to 100 records per request"}
                 }
             },
         },
@@ -178,14 +178,18 @@ class LeadsRequest(BaseModel):
         },
     },
 )
-
 def create_leads(
     body: LeadsRequest = Body(...),
     token=Depends(verify_jwt_token)
 ):
-    if not body.leads:
-        raise HTTPException(status_code=400, detail="Request body cannot be empty")
+    count = len(body.leads)
+    if count < 1 or count > MAX_LEADS:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail="Leads API accepts 1 to 100 records per request"
+        )
 
+    # duplicate‐realid check
     realids = [l.realid for l in body.leads]
     existing = supabase \
         .from_("leads") \
@@ -195,12 +199,19 @@ def create_leads(
         .data
     if existing:
         conflicts = [r["realid"] for r in existing]
-        raise HTTPException(status_code=409, detail=f"Duplicate realid(s): {conflicts}")
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Duplicate realid(s): {conflicts}"
+        )
 
+    # bulk insert
     records = [l.dict() for l in body.leads]
     try:
         resp = supabase.from_("leads").insert(records).execute()
-    except APIError as e:
-        raise HTTPException(status_code=500, detail="Internal server error")
+    except APIError:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Internal server error"
+        )
 
     return {"success": True, "inserted": len(resp.data)}
