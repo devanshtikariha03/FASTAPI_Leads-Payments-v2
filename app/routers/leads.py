@@ -168,7 +168,7 @@ class LeadsRequest(BaseModel):
             "description": "Payload too large or too many records",
             "content": {
                 "application/json": {
-                    "example": {"error": "Leads API accepts 1 to 10000 records per request"}
+                    "example": {"error": "Leads API accepts 1 to 100 records per request"}
                 }
             },
         },
@@ -191,7 +191,7 @@ def create_leads(
     if count < 1 or count > MAX_LEADS:
         raise HTTPException(
             status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-            detail="Leads API accepts 1 to 10000 records per request"
+            detail="Leads API accepts 1 to 100 records per request"
         )
 
     # duplicate‐realid check
