@@ -62,6 +62,13 @@ class Payment(BaseModel):
     payment_tag: Literal['<STAB','STAB','<MAD','MAD','<TAD','TAD'] = Field(
         ..., alias="Payment Tag"
     )
+  
+    class Config:
+        allow_population_by_field_name = True
+        fields = {
+            'amount': 'Amount',
+            'payment_tag': 'Payment Tag'
+        }
 
     @validator('date')
     def validate_range(cls, v):
