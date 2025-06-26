@@ -78,7 +78,7 @@ from ._schemas import ErrorResponse
 
 router = APIRouter(prefix="/api/v2/leads", tags=["leads"])
 
-MAX_LEADS = 10000
+MAX_LEADS = 100
 
 class Lead(BaseModel):
     date: str = Field(
