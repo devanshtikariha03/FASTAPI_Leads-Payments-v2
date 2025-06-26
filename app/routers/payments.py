@@ -34,7 +34,6 @@
 
 
 
-# app/routers/payments.py
 
 # app/routers/payments.py
 
@@ -58,21 +57,12 @@ class Payment(BaseModel):
         description="DATERANGE YYYY-MM-DD - YYYY-MM-DD"
     )
     realid: str = Field(..., min_length=1)
-    Amount: conint(gt=0)
-    payment_tag: Literal['<STAB','STAB','<MAD','MAD','<TAD','TAD'] = Field(
-        ..., alias="Payment Tag"
-    )
-  
-    class Config:
-        allow_population_by_field_name = True
-        fields = {
-            'amount': 'Amount',
-            'payment_tag': 'Payment Tag'
-        }
+    amount: conint(gt=0)
+    payment_tag: Literal['<STAB', 'STAB', '<MAD', 'MAD', '<TAD', 'TAD']
 
     @validator('date')
     def validate_range(cls, v):
-        parts = v.split(' - ')
+        parts = [p.strip() for p in v.split(' - ', 1)]
         if len(parts) != 2:
             raise ValueError("date must be two dates separated by ' - '")
         return v
@@ -91,7 +81,7 @@ class PaymentsRequest(BaseModel):
             "description": "Validation error or bad request",
             "content": {
                 "application/json": {
-                    "example": {"error": "Payment Tag is required"}
+                    "example": {"error": "Invalid request", "details": []}
                 }
             },
         },
@@ -127,7 +117,7 @@ class PaymentsRequest(BaseModel):
             "description": "Payload too large or too many records",
             "content": {
                 "application/json": {
-                    "example": {"error": "Payments API accepts 1 to 50 records per request"}
+                    "example": {"error": f"Payments API accepts 1 to {MAX_PAYMENTS} records per request"}
                 }
             },
         },
@@ -146,21 +136,38 @@ def create_payments(
     body: PaymentsRequest = Body(...),
     token=Depends(verify_jwt_token)
 ):
+    # 1) Enforce record count
     count = len(body.payments)
     if count < 1 or count > MAX_PAYMENTS:
         raise HTTPException(
             status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-            detail="Payments API accepts 1 to 50 records per request"
+            detail=f"Payments API accepts 1 to {MAX_PAYMENTS} records per request"
         )
 
-    records = [p.dict(by_alias=True) for p in body.payments]
+    # 2) Prep payload
+    records = [p.dict() for p in body.payments]
+
+    # 3) Attempt insert & surface real errors
     try:
         resp = supabase.from_("payments").insert(records).execute()
     except APIError as e:
+        # Log the raw Supabase error for debugging
+        print("❗️ Supabase APIError:", e.message, "| code:", getattr(e, "code", None))
+
+        # Unique-violation
         if getattr(e, "code", "") == "23505" or "duplicate key" in (e.message or "").lower():
-            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Duplicate payment record")
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Internal server error")
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Duplicate payment record"
+            )
+
+        # Forward client-side DB errors as 400
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=e.message
+        )
 
     return {"success": True, "inserted": len(resp.data)}
+
 
 
