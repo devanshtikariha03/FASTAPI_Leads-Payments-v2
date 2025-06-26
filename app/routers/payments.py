@@ -48,7 +48,7 @@ from ._schemas import ErrorResponse
 
 router = APIRouter(prefix="/api/v2/payments", tags=["payments"])
 
-MAX_PAYMENTS = 50
+MAX_PAYMENTS = 50000
 
 class Payment(BaseModel):
     date: str = Field(
