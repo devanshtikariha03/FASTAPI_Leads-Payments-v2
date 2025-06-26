@@ -59,7 +59,7 @@ class Payment(BaseModel):
     )
     realid: str = Field(..., min_length=1)
     Amount: conint(gt=0)
-    tag: Literal['<STAB','STAB','<MAD','MAD','<TAD','TAD'] = Field(
+    payment_tag: Literal['<STAB','STAB','<MAD','MAD','<TAD','TAD'] = Field(
         ..., alias="Payment Tag"
     )
 
