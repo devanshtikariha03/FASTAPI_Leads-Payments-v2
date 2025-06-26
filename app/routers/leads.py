@@ -64,6 +64,8 @@
 
 #leads.py
 
+#leads.py
+
 from fastapi import APIRouter, Depends, HTTPException, Body, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, EmailStr, conint, validator
@@ -100,7 +102,7 @@ class Lead(BaseModel):
     due_date: str
     total_due: conint(ge=0)
     min_due: conint(ge=0)
-    stab_due: conint(ge=0)
+    stab_due: Optional[conint(ge=0)] = None
     any_dispute_raised: Optional[str] = None
     days_past_due: Optional[conint(ge=0)] = None
     app_lastvisit_timestamp_after_bill_date: Optional[str] = None
@@ -218,4 +220,5 @@ def create_leads(
         )
 
     return {"success": True, "inserted": len(resp.data)}
+
 
