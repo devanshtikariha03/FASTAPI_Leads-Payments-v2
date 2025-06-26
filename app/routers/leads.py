@@ -62,6 +62,8 @@
 
 # app/routers/leads.py
 
+#leads.py
+
 from fastapi import APIRouter, Depends, HTTPException, Body, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, EmailStr, conint, validator
@@ -74,7 +76,7 @@ from ._schemas import ErrorResponse
 
 router = APIRouter(prefix="/api/v2/leads", tags=["leads"])
 
-MAX_LEADS = 100
+MAX_LEADS = 10000
 
 class Lead(BaseModel):
     date: str = Field(
@@ -98,6 +100,7 @@ class Lead(BaseModel):
     due_date: str
     total_due: conint(ge=0)
     min_due: conint(ge=0)
+    stab_due: conint(ge=0)
     any_dispute_raised: Optional[str] = None
     days_past_due: Optional[conint(ge=0)] = None
     app_lastvisit_timestamp_after_bill_date: Optional[str] = None
@@ -163,7 +166,7 @@ class LeadsRequest(BaseModel):
             "description": "Payload too large or too many records",
             "content": {
                 "application/json": {
-                    "example": {"error": "Leads API accepts 1 to 100 records per request"}
+                    "example": {"error": "Leads API accepts 1 to 10000 records per request"}
                 }
             },
         },
@@ -186,7 +189,7 @@ def create_leads(
     if count < 1 or count > MAX_LEADS:
         raise HTTPException(
             status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-            detail="Leads API accepts 1 to 100 records per request"
+            detail="Leads API accepts 1 to 10000 records per request"
         )
 
     # duplicate‐realid check
@@ -215,3 +218,4 @@ def create_leads(
         )
 
     return {"success": True, "inserted": len(resp.data)}
+
