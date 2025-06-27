@@ -86,6 +86,7 @@ class Lead(BaseModel):
         pattern=r'^\d{4}-\d{2}-\d{2}\s*-\s*\d{4}-\d{2}-\d{2}$',
         description="DATERANGE YYYY-MM-DD - YYYY-MM-DD"
     )
+    action_id: str
     realid: str = Field(..., min_length=1)
     name:   str = Field(..., min_length=1)
     phone_1: conint(ge=1_000_000_000, le=9_999_999_999)
