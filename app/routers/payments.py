@@ -56,6 +56,7 @@ class Payment(BaseModel):
         pattern=r'^\d{4}-\d{2}-\d{2}\s*-\s*\d{4}-\d{2}-\d{2}$',
         description="DATERANGE YYYY-MM-DD - YYYY-MM-DD"
     )
+    action_id: str
     realid: str = Field(..., min_length=1)
     amount: conint(gt=0)
     payment_tag: Literal['<STAB', 'STAB', '<MAD', 'MAD', '<TAD', 'TAD']
