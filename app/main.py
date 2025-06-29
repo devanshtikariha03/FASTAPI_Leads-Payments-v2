@@ -199,7 +199,6 @@ from app.routers import leads, payments
 
 app = FastAPI(
     title="PredixionAI-Onecard",
-    version="1.1.0",
     description="Secure endpoints for Integrating Predixion AI Platform with OneCard Platform"
 )
 
