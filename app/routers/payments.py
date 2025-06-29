@@ -118,7 +118,7 @@ class PaymentsRequest(BaseModel):
             "description": "Payload too large or too many records",
             "content": {
                 "application/json": {
-                    "example": {"error": f"Payments API accepts 1 to {MAX_PAYMENTS} records per request"}
+                    "example": {"error": f"Payments API accepts {MAX_PAYMENTS} records per request"}
                 }
             },
         },
@@ -142,7 +142,7 @@ def create_payments(
     if count < 1 or count > MAX_PAYMENTS:
         raise HTTPException(
             status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-            detail=f"Payments API accepts 1 to {MAX_PAYMENTS} records per request"
+            detail=f"Payments API accepts {MAX_PAYMENTS} records per request"
         )
 
     # 2) Prep payload
