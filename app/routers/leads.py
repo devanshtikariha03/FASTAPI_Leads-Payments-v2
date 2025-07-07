@@ -220,7 +220,7 @@ async def create_leads(  # NOW IT'S ASYNC!
             logger.info(f"Started background processing for batch {batch_id}")
             
             return JSONResponse(
-                status_code=202,
+                status_code=200,
                 content={
                     "success": True,
                     "batch_id": batch_id,
