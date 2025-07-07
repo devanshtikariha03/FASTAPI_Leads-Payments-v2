@@ -15,7 +15,7 @@ from ._schemas import ErrorResponse
 router = APIRouter(prefix="/api/v2/leads", tags=["leads"])
 
 MAX_LEADS = 100000
-CHUNK_SIZE = 400
+CHUNK_SIZE = 700
 MAX_RETRIES = 3
 RETRY_DELAY = 1
 
