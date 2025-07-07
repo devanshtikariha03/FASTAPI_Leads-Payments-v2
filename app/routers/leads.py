@@ -1,12 +1,10 @@
-from fastapi import APIRouter, Depends, HTTPException, Body, status, BackgroundTasks
+from fastapi import APIRouter, Depends, HTTPException, Body, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, EmailStr, conint, validator
 from typing import List, Optional, Literal
 from postgrest import APIError
 import asyncio
 import logging
-from datetime import datetime
-import uuid
 
 from app.core.db import supabase
 from app.core.auth import verify_jwt_token
@@ -14,11 +12,10 @@ from ._schemas import ErrorResponse
 
 router = APIRouter(prefix="/api/v2/leads", tags=["leads"])
 
-# Handle frontend's 100k records requirement
-MAX_LEADS = 100000  # Frontend sends 100k records
-CHUNK_SIZE = 200    # Smaller chunks for 100k records reliability
+MAX_LEADS = 100000
+CHUNK_SIZE = 200   # Smaller chunks for better reliability
 MAX_RETRIES = 3
-RETRY_DELAY = 1    # seconds
+RETRY_DELAY = 1
 
 logger = logging.getLogger(__name__)
 
@@ -61,78 +58,15 @@ class Lead(BaseModel):
         return v
 
 class LeadsRequest(BaseModel):
+    # only min_items enforced here—max handled manually
     leads: List[Lead] = Field(..., min_items=1)
-
-class BatchStatus(BaseModel):
-    batch_id: str
-    status: Literal['processing', 'completed', 'failed']
-    total_records: int
-    processed_records: int
-    failed_records: int
-    error_message: Optional[str] = None
-    created_at: str
-    updated_at: str
-
-# Store for tracking batch status (in production, use Redis or DB)
-batch_status_store = {}
-
-async def process_batch_async(batch_id: str, records: List[dict]):
-    """Process a batch of records asynchronously with retry logic"""
-    try:
-        batch_status_store[batch_id]['status'] = 'processing'
-        batch_status_store[batch_id]['updated_at'] = datetime.utcnow().isoformat()
-        
-        inserted = 0
-        failed = 0
-        
-        for chunk in chunked(records, CHUNK_SIZE):
-            retry_count = 0
-            chunk_success = False
-            
-            while retry_count < MAX_RETRIES and not chunk_success:
-                try:
-                    resp = supabase.from_("leads").insert(chunk).execute()
-                    if resp.data:
-                        inserted += len(resp.data)
-                        chunk_success = True
-                    else:
-                        raise Exception("No data returned from insert")
-                        
-                except Exception as e:
-                    retry_count += 1
-                    if retry_count < MAX_RETRIES:
-                        logger.warning(f"Batch {batch_id} chunk failed, retrying {retry_count}/{MAX_RETRIES}: {str(e)}")
-                        await asyncio.sleep(RETRY_DELAY * retry_count)  # Exponential backoff
-                    else:
-                        logger.error(f"Batch {batch_id} chunk failed after {MAX_RETRIES} retries: {str(e)}")
-                        failed += len(chunk)
-            
-            # Update progress
-            batch_status_store[batch_id]['processed_records'] = inserted
-            batch_status_store[batch_id]['failed_records'] = failed
-            batch_status_store[batch_id]['updated_at'] = datetime.utcnow().isoformat()
-        
-        # Final status update
-        if failed == 0:
-            batch_status_store[batch_id]['status'] = 'completed'
-        else:
-            batch_status_store[batch_id]['status'] = 'failed'
-            batch_status_store[batch_id]['error_message'] = f"{failed} records failed to insert"
-            
-        batch_status_store[batch_id]['updated_at'] = datetime.utcnow().isoformat()
-        
-    except Exception as e:
-        logger.error(f"Batch {batch_id} processing failed: {str(e)}")
-        batch_status_store[batch_id]['status'] = 'failed'
-        batch_status_store[batch_id]['error_message'] = str(e)
-        batch_status_store[batch_id]['updated_at'] = datetime.utcnow().isoformat()
 
 @router.post(
     "",
     summary="Receive and insert leads",
     response_model=dict,
     responses={
-        202: {"description": "Leads batch accepted for processing"},
+        200: {"description": "Leads processed successfully"},
         400: {
             "model": ErrorResponse,
             "description": "Validation error or bad request",
@@ -189,8 +123,7 @@ async def process_batch_async(batch_id: str, records: List[dict]):
         },
     },
 )
-async def create_leads(
-    background_tasks: BackgroundTasks,
+def create_leads(
     body: LeadsRequest = Body(...),
     token=Depends(verify_jwt_token)
 ):
@@ -198,13 +131,13 @@ async def create_leads(
     if count < 1 or count > MAX_LEADS:
         raise HTTPException(
             status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-            detail=f"Leads API accepts 1 to {MAX_LEADS} records per request"
+            detail="Leads API accepts 1 to 100000 records per request"
         )
 
-    # Strategic duplicate check - check in batches to avoid timeout
+    # duplicate‐realid check - chunked for large datasets
     realids = [l.realid for l in body.leads]
     
-    # For 100k records, check duplicates in chunks to avoid DB timeout
+    # Check duplicates in chunks to avoid timeout with 100k records
     duplicate_check_chunk_size = 5000
     all_conflicts = []
     
@@ -226,11 +159,12 @@ async def create_leads(
     if all_conflicts:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail=f"Duplicate realid(s): {all_conflicts[:10]}..."  # Show first 10
+            detail=f"Duplicate realid(s): {all_conflicts}"
         )
 
-    # Convert leads to records
+    # bulk insert in chunks of 200, convert date fields to daterange
     def to_daterange(date_str):
+        # Expects 'YYYY-MM-DD - YYYY-MM-DD', returns '[YYYY-MM-DD,YYYY-MM-DD]'
         parts = [p.strip() for p in date_str.split(' - ', 1)]
         if len(parts) == 2:
             return f"[{parts[0]},{parts[1]}]"
@@ -239,118 +173,44 @@ async def create_leads(
     records = []
     for l in body.leads:
         rec = l.dict()
+        # Convert 'date' field to daterange if present
         if "date" in rec:
             rec["date"] = to_daterange(rec["date"])
-        records.append(rec)
-
-    # Create batch tracking
-    batch_id = str(uuid.uuid4())
-    batch_status_store[batch_id] = {
-        'batch_id': batch_id,
-        'status': 'processing',
-        'total_records': count,
-        'processed_records': 0,
-        'failed_records': 0,
-        'error_message': None,
-        'created_at': datetime.utcnow().isoformat(),
-        'updated_at': datetime.utcnow().isoformat()
-    }
-
-    # Process asynchronously
-    background_tasks.add_task(process_batch_async, batch_id, records)
-
-    return JSONResponse(
-        status_code=202,
-        content={
-            "success": True,
-            "batch_id": batch_id,
-            "total_records": count,
-            "message": "Batch accepted for processing",
-            "status_url": f"/api/v2/leads/status/{batch_id}"
-        }
-    )
-
-@router.get(
-    "/status/{batch_id}",
-    summary="Get batch processing status",
-    response_model=BatchStatus,
-    responses={
-        200: {"description": "Batch status retrieved successfully"},
-        404: {"description": "Batch not found"},
-    },
-)
-async def get_batch_status(batch_id: str):
-    """Get the status of a batch processing job"""
-    if batch_id not in batch_status_store:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Batch not found"
-        )
-    
-    return BatchStatus(**batch_status_store[batch_id])
-
-@router.post(
-    "/sync",
-    summary="Synchronous lead insertion (for smaller batches)",
-    response_model=dict,
-    responses={
-        200: {"description": "Leads processed successfully"},
-        413: {"description": "Batch too large for synchronous processing"},
-    },
-)
-async def create_leads_sync(
-    body: LeadsRequest = Body(...),
-    token=Depends(verify_jwt_token)
-):
-    """Synchronous endpoint for smaller batches (max 1000 records)"""
-    count = len(body.leads)
-    if count > 1000:
-        raise HTTPException(
-            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-            detail="Synchronous endpoint accepts max 1000 records. Use async endpoint for larger batches."
-        )
-    
-    # Use original synchronous logic for small batches
-    realids = [l.realid for l in body.leads]
-    existing = supabase \
-        .from_("leads") \
-        .select("realid") \
-        .in_("realid", realids) \
-        .execute() \
-        .data
-    
-    if existing:
-        conflicts = [r["realid"] for r in existing]
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail=f"Duplicate realid(s): {conflicts}"
-        )
-
-    def to_daterange(date_str):
-        parts = [p.strip() for p in date_str.split(' - ', 1)]
-        if len(parts) == 2:
-            return f"[{parts[0]},{parts[1]}]"
-        return date_str
-
-    records = []
-    for l in body.leads:
-        rec = l.dict()
-        if "date" in rec:
-            rec["date"] = to_daterange(rec["date"])
+        # Optionally convert bill_date and due_date if your DB expects daterange (else remove these lines)
+        # if "bill_date" in rec:
+        #     rec["bill_date"] = to_daterange(rec["bill_date"])
+        # if "due_date" in rec:
+        #     rec["due_date"] = to_daterange(rec["due_date"])
         records.append(rec)
 
     inserted = 0
     try:
         for batch in chunked(records, CHUNK_SIZE):
-            resp = supabase.from_("leads").insert(batch).execute()
-            if not resp.data:
-                raise HTTPException(
-                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                    detail="Internal server error"
-                )
-            inserted += len(resp.data)
-    except APIError as e:
-        logger.error(f"Supabase API error: {str(e)}")
+            retry_count = 0
+            batch_success = False
+            
+            while retry_count < MAX_RETRIES and not batch_success:
+                try:
+                    resp = supabase.from_("leads").insert(batch).execute()
+                    if not resp.data:
+                        raise Exception("No data returned from insert")
+                    inserted += len(resp.data)
+                    batch_success = True
+                except Exception as e:
+                    retry_count += 1
+                    if retry_count < MAX_RETRIES:
+                        logger.warning(f"Batch failed, retrying {retry_count}/{MAX_RETRIES}: {str(e)}")
+                        # Small delay before retry
+                        import time
+                        time.sleep(RETRY_DELAY * retry_count)
+                    else:
+                        # Final retry failed, raise original error
+                        raise HTTPException(
+                            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                            detail="Internal server error"
+                        )
+                        
+    except APIError:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Internal server error"
