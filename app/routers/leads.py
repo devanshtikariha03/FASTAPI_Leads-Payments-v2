@@ -1,10 +1,12 @@
-from fastapi import APIRouter, Depends, HTTPException, Body, status
+from fastapi import APIRouter, Depends, HTTPException, Body, status, BackgroundTasks
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, EmailStr, conint, validator
 from typing import List, Optional, Literal
 from postgrest import APIError
 import asyncio
 import logging
+import uuid
+from datetime import datetime
 
 from app.core.db import supabase
 from app.core.auth import verify_jwt_token
@@ -13,11 +15,14 @@ from ._schemas import ErrorResponse
 router = APIRouter(prefix="/api/v2/leads", tags=["leads"])
 
 MAX_LEADS = 100000
-CHUNK_SIZE = 50   # Smaller chunks for better reliability
+CHUNK_SIZE = 50
 MAX_RETRIES = 3
 RETRY_DELAY = 1
 
 logger = logging.getLogger(__name__)
+
+# In-memory batch tracking (replace with Redis/DB in production)
+batch_status_store = {}
 
 class Lead(BaseModel):
     date: str = Field(
@@ -58,166 +63,212 @@ class Lead(BaseModel):
         return v
 
 class LeadsRequest(BaseModel):
-    # only min_items enforced here—max handled manually
     leads: List[Lead] = Field(..., min_items=1)
 
-@router.post(
-    "",
-    summary="Receive and insert leads",
-    response_model=dict,
-    responses={
-        200: {"description": "Leads processed successfully"},
-        400: {
-            "model": ErrorResponse,
-            "description": "Validation error or bad request",
-            "content": {
-                "application/json": {
-                    "example": {"error": "realid is required"}
-                }
-            },
-        },
-        401: {
-            "model": ErrorResponse,
-            "description": "Invalid or expired token",
-            "content": {
-                "application/json": {
-                    "example": {"error": "Invalid or expired token"}
-                }
-            },
-        },
-        403: {
-            "model": ErrorResponse,
-            "description": "Authentication required",
-            "content": {
-                "application/json": {
-                    "example": {"error": "Authentication required"}
-                }
-            },
-        },
-        409: {
-            "model": ErrorResponse,
-            "description": "Conflict — duplicate realid",
-            "content": {
-                "application/json": {
-                    "example": {"error": "Duplicate realid(s): ['OC123']"}
-                }
-            },
-        },
-        413: {
-            "model": ErrorResponse,
-            "description": "Payload too large or too many records",
-            "content": {
-                "application/json": {
-                    "example": {"error": "Leads API accepts 1 to 100000 records per request"}
-                }
-            },
-        },
-        500: {
-            "model": ErrorResponse,
-            "description": "Internal server error",
-            "content": {
-                "application/json": {
-                    "example": {"error": "Internal server error"}
-                }
-            },
-        },
-    },
-)
-def create_leads(
-    body: LeadsRequest = Body(...),
-    token=Depends(verify_jwt_token)
-):
-    count = len(body.leads)
-    if count < 1 or count > MAX_LEADS:
-        raise HTTPException(
-            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-            detail="Leads API accepts 1 to 100000 records per request"
-        )
+class BatchStatus(BaseModel):
+    batch_id: str
+    status: Literal['processing', 'completed', 'failed']
+    total_records: int
+    processed_records: int
+    failed_records: int
+    error_message: Optional[str]
+    created_at: str
+    updated_at: str
 
-    # duplicate‐realid check - chunked for large datasets
-    realids = [l.realid for l in body.leads]
-    
-    # Check duplicates in chunks to avoid timeout with 100k records
-    duplicate_check_chunk_size = 5000
+def chunked(iterable, size):
+    for i in range(0, len(iterable), size):
+        yield iterable[i:i + size]
+
+def to_daterange(date_str):
+    parts = [p.strip() for p in date_str.split(' - ', 1)]
+    if len(parts) == 2:
+        return f"[{parts[0]},{parts[1]}]"
+    return date_str
+
+async def process_batch_async(batch_id: str, records: List[dict]):
+    """Background task to process large batches"""
+    try:
+        batch_status_store[batch_id]['status'] = 'processing'
+        inserted = 0
+        failed = 0
+        
+        logger.info(f"Starting batch {batch_id} with {len(records)} records")
+        
+        for i, batch in enumerate(chunked(records, CHUNK_SIZE)):
+            retry_count = 0
+            batch_success = False
+            
+            while retry_count < MAX_RETRIES and not batch_success:
+                try:
+                    logger.info(f"Processing chunk {i+1}, attempt {retry_count+1}")
+                    resp = supabase.from_("leads").insert(batch).execute()
+                    if not resp.data:
+                        raise Exception("No data returned from insert")
+                    inserted += len(resp.data)
+                    batch_success = True
+                    logger.info(f"Chunk {i+1} successful: {len(resp.data)} records")
+                except Exception as e:
+                    retry_count += 1
+                    if retry_count < MAX_RETRIES:
+                        logger.warning(f"Chunk {i+1} failed, retrying {retry_count}/{MAX_RETRIES}: {str(e)}")
+                        await asyncio.sleep(RETRY_DELAY * retry_count)  # Async sleep
+                    else:
+                        logger.error(f"Chunk {i+1} failed permanently: {str(e)}")
+                        failed += len(batch)
+            
+            # Update status after each chunk
+            batch_status_store[batch_id]['processed_records'] = inserted
+            batch_status_store[batch_id]['failed_records'] = failed
+            batch_status_store[batch_id]['updated_at'] = datetime.utcnow().isoformat()
+        
+        # Final status update
+        batch_status_store[batch_id]['status'] = 'completed' if failed == 0 else 'failed'
+        batch_status_store[batch_id]['updated_at'] = datetime.utcnow().isoformat()
+        
+        logger.info(f"Batch {batch_id} completed: {inserted} inserted, {failed} failed")
+        
+    except Exception as e:
+        logger.error(f"Batch {batch_id} failed with error: {str(e)}")
+        batch_status_store[batch_id]['status'] = 'failed'
+        batch_status_store[batch_id]['error_message'] = str(e)
+        batch_status_store[batch_id]['updated_at'] = datetime.utcnow().isoformat()
+
+async def check_duplicates_async(realids: List[str]) -> List[str]:
+    """Async duplicate check in chunks"""
+    duplicate_check_chunk_size = 1000
     all_conflicts = []
     
     for chunk_start in range(0, len(realids), duplicate_check_chunk_size):
         chunk_end = min(chunk_start + duplicate_check_chunk_size, len(realids))
         chunk_realids = realids[chunk_start:chunk_end]
         
-        existing = supabase \
-            .from_("leads") \
-            .select("realid") \
-            .in_("realid", chunk_realids) \
-            .execute() \
-            .data
+        logger.info(f"Checking duplicates for chunk {chunk_start}-{chunk_end}")
         
-        if existing:
-            chunk_conflicts = [r["realid"] for r in existing]
-            all_conflicts.extend(chunk_conflicts)
+        try:
+            existing = supabase \
+                .from_("leads") \
+                .select("realid") \
+                .in_("realid", chunk_realids) \
+                .execute() \
+                .data
+            
+            if existing:
+                chunk_conflicts = [r["realid"] for r in existing]
+                all_conflicts.extend(chunk_conflicts)
+                
+        except Exception as e:
+            logger.error(f"Duplicate check failed for chunk {chunk_start}-{chunk_end}: {str(e)}")
+            raise
     
-    if all_conflicts:
+    return all_conflicts
+
+@router.post("")
+async def create_leads(  # NOW IT'S ASYNC!
+    background_tasks: BackgroundTasks,
+    body: LeadsRequest = Body(...),
+    token=Depends(verify_jwt_token)
+):
+    count = len(body.leads)
+    logger.info(f"Received request for {count} leads")
+    
+    if count < 1 or count > MAX_LEADS:
         raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail=f"Duplicate realid(s): {all_conflicts}"
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail="Leads API accepts 1 to 100000 records per request"
         )
 
-    # bulk insert in chunks of 200, convert date fields to daterange
-    def to_daterange(date_str):
-        # Expects 'YYYY-MM-DD - YYYY-MM-DD', returns '[YYYY-MM-DD,YYYY-MM-DD]'
-        parts = [p.strip() for p in date_str.split(' - ', 1)]
-        if len(parts) == 2:
-            return f"[{parts[0]},{parts[1]}]"
-        return date_str
-
-    records = []
-    for l in body.leads:
-        rec = l.dict()
-        # Convert 'date' field to daterange if present
-        if "date" in rec:
-            rec["date"] = to_daterange(rec["date"])
-        # Optionally convert bill_date and due_date if your DB expects daterange (else remove these lines)
-        # if "bill_date" in rec:
-        #     rec["bill_date"] = to_daterange(rec["bill_date"])
-        # if "due_date" in rec:
-        #     rec["due_date"] = to_daterange(rec["due_date"])
-        records.append(rec)
-
-    inserted = 0
     try:
-        for batch in chunked(records, CHUNK_SIZE):
-            retry_count = 0
-            batch_success = False
+        # Async duplicate check
+        realids = [l.realid for l in body.leads]
+        logger.info("Starting duplicate check...")
+        
+        all_conflicts = await check_duplicates_async(realids)
+        
+        if all_conflicts:
+            logger.warning(f"Found {len(all_conflicts)} duplicate realids")
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"Duplicate realid(s): {all_conflicts}"
+            )
+        
+        logger.info("Duplicate check passed")
+        
+        # Prepare records
+        records = []
+        for l in body.leads:
+            rec = l.dict()
+            if "date" in rec:
+                rec["date"] = to_daterange(rec["date"])
+            records.append(rec)
+        
+        # For large datasets, use background processing
+        if count > 500:  # Adjust threshold based on your needs
+            batch_id = str(uuid.uuid4())
+            batch_status_store[batch_id] = {
+                'batch_id': batch_id,
+                'status': 'processing',
+                'total_records': count,
+                'processed_records': 0,
+                'failed_records': 0,
+                'error_message': None,
+                'created_at': datetime.utcnow().isoformat(),
+                'updated_at': datetime.utcnow().isoformat()
+            }
             
-            while retry_count < MAX_RETRIES and not batch_success:
-                try:
-                    resp = supabase.from_("leads").insert(batch).execute()
-                    if not resp.data:
-                        raise Exception("No data returned from insert")
-                    inserted += len(resp.data)
-                    batch_success = True
-                except Exception as e:
-                    retry_count += 1
-                    if retry_count < MAX_RETRIES:
-                        logger.warning(f"Batch failed, retrying {retry_count}/{MAX_RETRIES}: {str(e)}")
-                        # Small delay before retry
-                        import time
-                        time.sleep(RETRY_DELAY * retry_count)
-                    else:
-                        # Final retry failed, raise original error
-                        raise HTTPException(
-                            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                            detail="Internal server error"
-                        )
-                        
-    except APIError:
+            background_tasks.add_task(process_batch_async, batch_id, records)
+            
+            logger.info(f"Started background processing for batch {batch_id}")
+            
+            return JSONResponse(
+                status_code=202,
+                content={
+                    "success": True,
+                    "batch_id": batch_id,
+                    "message": "Batch accepted for processing",
+                    "status_url": f"/api/v2/leads/status/{batch_id}"
+                }
+            )
+        
+        # For smaller datasets, process synchronously
+        else:
+            inserted = 0
+            for batch in chunked(records, CHUNK_SIZE):
+                retry_count = 0
+                batch_success = False
+                
+                while retry_count < MAX_RETRIES and not batch_success:
+                    try:
+                        resp = supabase.from_("leads").insert(batch).execute()
+                        if not resp.data:
+                            raise Exception("No data returned from insert")
+                        inserted += len(resp.data)
+                        batch_success = True
+                    except Exception as e:
+                        retry_count += 1
+                        if retry_count < MAX_RETRIES:
+                            logger.warning(f"Batch failed, retrying {retry_count}/{MAX_RETRIES}: {str(e)}")
+                            await asyncio.sleep(RETRY_DELAY * retry_count)  # Async sleep
+                        else:
+                            raise HTTPException(
+                                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                                detail="Internal server error"
+                            )
+            
+            logger.info(f"Synchronous processing completed: {inserted} records")
+            return {"success": True, "inserted": inserted}
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Unexpected error: {str(e)}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Internal server error"
         )
 
-    return {"success": True, "inserted": inserted}
-
-def chunked(iterable, size):
-    for i in range(0, len(iterable), size):
-        yield iterable[i:i + size]
+@router.get("/status/{batch_id}", response_model=BatchStatus)
+async def get_batch_status(batch_id: str):
+    """Get status of a background batch"""
+    if batch_id not in batch_status_store:
+        raise HTTPException(status_code=404, detail="Batch not found")
+    return batch_status_store[batch_id]
