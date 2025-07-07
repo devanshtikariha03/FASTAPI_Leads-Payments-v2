@@ -145,8 +145,20 @@ def create_payments(
             detail=f"Payments API accepts {MAX_PAYMENTS} records per request"
         )
 
-    # 2) Prep payload
-    records = [p.dict() for p in body.payments]
+
+    # 2) Prep payload and convert date string to Postgres daterange format
+    def to_daterange(date_str):
+        # Expects 'YYYY-MM-DD - YYYY-MM-DD', returns '[YYYY-MM-DD,YYYY-MM-DD]'
+        parts = [p.strip() for p in date_str.split(' - ', 1)]
+        if len(parts) == 2:
+            return f"[{parts[0]},{parts[1]}]"
+        return date_str
+
+    records = []
+    for p in body.payments:
+        rec = p.dict()
+        rec["date"] = to_daterange(rec["date"])
+        records.append(rec)
 
     # 3) Attempt insert & surface real errors
     try:

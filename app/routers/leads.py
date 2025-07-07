@@ -210,16 +210,48 @@ def create_leads(
             detail=f"Duplicate realid(s): {conflicts}"
         )
 
-    # bulk insert
-    records = [l.dict() for l in body.leads]
+
+    # bulk insert in chunks of 1000, convert date fields to daterange
+    def to_daterange(date_str):
+        # Expects 'YYYY-MM-DD - YYYY-MM-DD', returns '[YYYY-MM-DD,YYYY-MM-DD]'
+        parts = [p.strip() for p in date_str.split(' - ', 1)]
+        if len(parts) == 2:
+            return f"[{parts[0]},{parts[1]}]"
+        return date_str
+
+    records = []
+    for l in body.leads:
+        rec = l.dict()
+        # Convert 'date' field to daterange if present
+        if "date" in rec:
+            rec["date"] = to_daterange(rec["date"])
+        # Optionally convert bill_date and due_date if your DB expects daterange (else remove these lines)
+        # if "bill_date" in rec:
+        #     rec["bill_date"] = to_daterange(rec["bill_date"])
+        # if "due_date" in rec:
+        #     rec["due_date"] = to_daterange(rec["due_date"])
+        records.append(rec)
+
+    inserted = 0
     try:
-        resp = supabase.from_("leads").insert(records).execute()
+        for batch in chunked(records, 1000):
+            resp = supabase.from_("leads").insert(batch).execute()
+            if not resp.data:
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail="Internal server error"
+                )
+            inserted += len(resp.data)
     except APIError:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Internal server error"
         )
 
-    return {"success": True, "inserted": len(resp.data)}
+    return {"success": True, "inserted": inserted}
+
+def chunked(iterable, size):
+    for i in range(0, len(iterable), size):
+        yield iterable[i:i + size]
 
 
