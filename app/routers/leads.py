@@ -103,7 +103,7 @@ async def process_batch_async(batch_id: str, records: List[dict]):
                     logger.info(f"Processing chunk {i+1}, attempt {retry_count+1}")
                     resp = supabase.from_("leads").insert(batch).execute()
                     if not resp.data:
-                        raise APIError("No data returned from insert")
+                        raise Exception("No data returned from insert")
                     inserted += len(resp.data)
                     batch_success = True
                     logger.info(f"Chunk {i+1} successful: {len(resp.data)} records")
@@ -111,90 +111,59 @@ async def process_batch_async(batch_id: str, records: List[dict]):
                     retry_count += 1
                     if retry_count < MAX_RETRIES:
                         logger.warning(f"Chunk {i+1} failed, retrying {retry_count}/{MAX_RETRIES}: {str(e)}")
-                        await asyncio.sleep(RETRY_DELAY * retry_count)
+                        await asyncio.sleep(RETRY_DELAY * retry_count)  # Async sleep
                     else:
                         logger.error(f"Chunk {i+1} failed permanently: {str(e)}")
                         failed += len(batch)
-                        batch_status_store[batch_id]['error_message'] = str(e)
             
+            # Update status after each chunk
             batch_status_store[batch_id]['processed_records'] = inserted
             batch_status_store[batch_id]['failed_records'] = failed
             batch_status_store[batch_id]['updated_at'] = datetime.utcnow().isoformat()
         
+        # Final status update
         batch_status_store[batch_id]['status'] = 'completed' if failed == 0 else 'failed'
         batch_status_store[batch_id]['updated_at'] = datetime.utcnow().isoformat()
+        
+        logger.info(f"Batch {batch_id} completed: {inserted} inserted, {failed} failed")
         
     except Exception as e:
         logger.error(f"Batch {batch_id} failed with error: {str(e)}")
         batch_status_store[batch_id]['status'] = 'failed'
         batch_status_store[batch_id]['error_message'] = str(e)
         batch_status_store[batch_id]['updated_at'] = datetime.utcnow().isoformat()
-        raise
 
-@router.post(
-    "",
-    summary="Receive and insert leads",
-    response_model=dict,
-    responses={
-        200: {"description": "Leads processed successfully"},
-        202: {"description": "Batch accepted for processing"},
-        400: {
-            "model": ErrorResponse,
-            "description": "Validation error or bad request",
-            "content": {
-                "application/json": {
-                    "example": {"error": "realid is required"}
-                }
-            },
-        },
-        401: {
-            "model": ErrorResponse,
-            "description": "Invalid or expired token",
-            "content": {
-                "application/json": {
-                    "example": {"error": "Invalid or expired token"}
-                }
-            },
-        },
-        403: {
-            "model": ErrorResponse,
-            "description": "Authentication required",
-            "content": {
-                "application/json": {
-                    "example": {"error": "Authentication required"}
-                }
-            },
-        },
-        409: {
-            "model": ErrorResponse,
-            "description": "Conflict — duplicate realid",
-            "content": {
-                "application/json": {
-                    "example": {"error": "Duplicate realid(s): ['OC123']"}
-                }
-            },
-        },
-        413: {
-            "model": ErrorResponse,
-            "description": "Payload too large or too many records",
-            "content": {
-                "application/json": {
-                    "example": {"error": "Leads API accepts 1 to 100000 records per request"}
-                }
-            },
-        },
-        500: {
-            "model": ErrorResponse,
-            "description": "Internal server error",
-            "content": {
-                "application/json": {
-                    "example": {"error": "Internal server error"}
-                }
-            },
-        },
-    },
-)
-async def create_leads(
+async def check_duplicates_async(realids: List[str]) -> List[str]:
+    """Async duplicate check in chunks"""
+    duplicate_check_chunk_size = 1000
+    all_conflicts = []
+    
+    for chunk_start in range(0, len(realids), duplicate_check_chunk_size):
+        chunk_end = min(chunk_start + duplicate_check_chunk_size, len(realids))
+        chunk_realids = realids[chunk_start:chunk_end]
+        
+        logger.info(f"Checking duplicates for chunk {chunk_start}-{chunk_end}")
+        
+        try:
+            existing = supabase \
+                .from_("leads") \
+                .select("realid") \
+                .in_("realid", chunk_realids) \
+                .execute() \
+                .data
+            
+            if existing:
+                chunk_conflicts = [r["realid"] for r in existing]
+                all_conflicts.extend(chunk_conflicts)
+                
+        except Exception as e:
+            logger.error(f"Duplicate check failed for chunk {chunk_start}-{chunk_end}: {str(e)}")
+            raise
+    
+    return all_conflicts
+
+@router.post("")
+async def create_leads(  # NOW IT'S ASYNC!
     background_tasks: BackgroundTasks,
     body: LeadsRequest = Body(...),
     token=Depends(verify_jwt_token)
@@ -205,7 +174,7 @@ async def create_leads(
     if count < 1 or count > MAX_LEADS:
         raise HTTPException(
             status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-            detail={"error": "Leads API accepts 1 to 100000 records per request"}
+            detail="Leads API accepts 1 to 100000 records per request"
         )
 
     try:
@@ -213,37 +182,16 @@ async def create_leads(
         realids = [l.realid for l in body.leads]
         logger.info("Starting duplicate check...")
         
-        duplicate_check_chunk_size = 5000
-        all_conflicts = []
-        
-        for chunk_start in range(0, len(realids), duplicate_check_chunk_size):
-            chunk_end = min(chunk_start + duplicate_check_chunk_size, len(realids))
-            chunk_realids = realids[chunk_start:chunk_end]
-            
-            try:
-                existing = supabase \
-                    .from_("leads") \
-                    .select("realid") \
-                    .in_("realid", chunk_realids) \
-                    .execute() \
-                    .data
-                
-                if existing:
-                    chunk_conflicts = [r["realid"] for r in existing]
-                    all_conflicts.extend(chunk_conflicts)
-            except APIError as e:
-                logger.error(f"Duplicate check failed for chunk: {str(e)}")
-                raise HTTPException(
-                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                    detail={"error": "Internal server error during duplicate check"}
-                )
+        all_conflicts = await check_duplicates_async(realids)
         
         if all_conflicts:
             logger.warning(f"Found {len(all_conflicts)} duplicate realids")
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
-                detail={"error": f"Duplicate realid(s): {all_conflicts}"}
+                detail=f"Duplicate realid(s): {all_conflicts}"
             )
+        
+        logger.info("Duplicate check passed")
         
         # Prepare records
         records = []
@@ -253,8 +201,8 @@ async def create_leads(
                 rec["date"] = to_daterange(rec["date"])
             records.append(rec)
         
-        # Large datasets use background processing
-        if count > 500:
+        # For large datasets, use background processing
+        if count > 500:  # Adjust threshold based on your needs
             batch_id = str(uuid.uuid4())
             batch_status_store[batch_id] = {
                 'batch_id': batch_id,
@@ -269,6 +217,8 @@ async def create_leads(
             
             background_tasks.add_task(process_batch_async, batch_id, records)
             
+            logger.info(f"Started background processing for batch {batch_id}")
+            
             return JSONResponse(
                 status_code=202,
                 content={
@@ -279,32 +229,33 @@ async def create_leads(
                 }
             )
         
-        # Small datasets process synchronously
-        inserted = 0
-        for batch in chunked(records, CHUNK_SIZE):
-            retry_count = 0
-            batch_success = False
+        # For smaller datasets, process synchronously
+        else:
+            inserted = 0
+            for batch in chunked(records, CHUNK_SIZE):
+                retry_count = 0
+                batch_success = False
+                
+                while retry_count < MAX_RETRIES and not batch_success:
+                    try:
+                        resp = supabase.from_("leads").insert(batch).execute()
+                        if not resp.data:
+                            raise Exception("No data returned from insert")
+                        inserted += len(resp.data)
+                        batch_success = True
+                    except Exception as e:
+                        retry_count += 1
+                        if retry_count < MAX_RETRIES:
+                            logger.warning(f"Batch failed, retrying {retry_count}/{MAX_RETRIES}: {str(e)}")
+                            await asyncio.sleep(RETRY_DELAY * retry_count)  # Async sleep
+                        else:
+                            raise HTTPException(
+                                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                                detail="Internal server error"
+                            )
             
-            while retry_count < MAX_RETRIES and not batch_success:
-                try:
-                    resp = supabase.from_("leads").insert(batch).execute()
-                    if not resp.data:
-                        raise APIError("No data returned from insert")
-                    inserted += len(resp.data)
-                    batch_success = True
-                except APIError as e:
-                    retry_count += 1
-                    if retry_count < MAX_RETRIES:
-                        logger.warning(f"Batch failed, retrying {retry_count}/{MAX_RETRIES}: {str(e)}")
-                        await asyncio.sleep(RETRY_DELAY * retry_count)
-                    else:
-                        logger.error(f"Batch failed permanently: {str(e)}")
-                        raise HTTPException(
-                            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                            detail={"error": "Internal server error"}
-                        )
-        
-        return {"success": True, "inserted": inserted}
+            logger.info(f"Synchronous processing completed: {inserted} records")
+            return {"success": True, "inserted": inserted}
             
     except HTTPException:
         raise
@@ -312,28 +263,12 @@ async def create_leads(
         logger.error(f"Unexpected error: {str(e)}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail={"error": "Internal server error"}
+            detail="Internal server error"
         )
 
-@router.get(
-    "/status/{batch_id}",
-    response_model=BatchStatus,
-    responses={
-        404: {
-            "model": ErrorResponse,
-            "description": "Batch not found",
-            "content": {
-                "application/json": {
-                    "example": {"error": "Batch not found"}
-                }
-            },
-        }
-    }
-)
+@router.get("/status/{batch_id}", response_model=BatchStatus)
 async def get_batch_status(batch_id: str):
+    """Get status of a background batch"""
     if batch_id not in batch_status_store:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail={"error": "Batch not found"}
-        )
+        raise HTTPException(status_code=404, detail="Batch not found")
     return batch_status_store[batch_id]
