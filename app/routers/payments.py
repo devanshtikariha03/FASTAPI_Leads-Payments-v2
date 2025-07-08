@@ -17,27 +17,20 @@ MAX_PAYMENTS = 1
 class Payment(BaseModel):
     date: str = Field(
         ...,
-        pattern=r'^\d{4}-\d{2}-\d{2}\s*-\s*\d{4}-\d{2}-\d{2}$',
-        description="DATERANGE YYYY-MM-DD - YYYY-MM-DD (will be converted to single date)"
+        pattern=r'^\d{4}-\d{2}-\d{2}$',  # Only single date allowed
+        description="Single date in format YYYY-MM-DD"
     )
     action_id: str
     realid: str = Field(..., min_length=1)
-    amount: confloat(gt=0)  # Changed from conint to confloat
+    amount: confloat(gt=0)
     payment_tag: Literal['<STAB', 'STAB', '<MAD', 'MAD', '<TAD', 'TAD']
 
     @validator('date')
-    def validate_range(cls, v):
-        parts = [p.strip() for p in v.split(' - ', 1)]
-        if len(parts) != 2:
-            raise ValueError("date must be two dates separated by ' - '")
-        
-        # Validate that both dates are valid
+    def validate_single_date(cls, v):
         try:
-            datetime.strptime(parts[0], '%Y-%m-%d')
-            datetime.strptime(parts[1], '%Y-%m-%d')
+            datetime.strptime(v, '%Y-%m-%d')
         except ValueError:
-            raise ValueError("dates must be in YYYY-MM-DD format")
-        
+            raise ValueError("date must be in YYYY-MM-DD format")
         return v
 
 class PaymentsRequest(BaseModel):
@@ -117,23 +110,11 @@ def create_payments(
             detail=f"Payments API accepts {MAX_PAYMENTS} records per request"
         )
 
-    # 2) Prep payload and convert date range to single date
-    def convert_date_range_to_single(date_str):
-        """
-        Convert date range 'YYYY-MM-DD - YYYY-MM-DD' to single date.
-        Uses the first date from the range.
-        """
-        parts = [p.strip() for p in date_str.split(' - ', 1)]
-        if len(parts) == 2:
-            # Return the first date from the range
-            return parts[0]
-        return date_str
-
+    # 2) Prep payload (no date conversion needed)
     records = []
     for p in body.payments:
         rec = p.dict()
-        rec["date"] = convert_date_range_to_single(rec["date"])
-        # amount is already float from confloat validation
+        # date is already a single date, amount is already float
         records.append(rec)
 
     # 3) Attempt insert & surface real errors
