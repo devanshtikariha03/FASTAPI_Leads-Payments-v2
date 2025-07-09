@@ -3,6 +3,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, EmailStr, conint, validator
 from typing import List, Optional, Literal
 from postgrest import APIError
+from contextlib import asynccontextmanager
 import asyncio
 import logging
 import uuid
@@ -18,6 +19,12 @@ MAX_LEADS = 100000
 CHUNK_SIZE = 5000
 MAX_RETRIES = 3
 RETRY_DELAY = 1
+
+# Rate limiting and connection pooling
+MAX_CONCURRENT_REQUESTS = 2  # Adjust based on your Azure limits
+MAX_DB_CONNECTIONS = 3       # Adjust based on your database capacity
+request_semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
+db_semaphore = asyncio.Semaphore(MAX_DB_CONNECTIONS)
 
 logger = logging.getLogger(__name__)
 
@@ -85,8 +92,32 @@ def to_daterange(date_str):
         return f"[{parts[0]},{parts[1]}]"
     return date_str
 
+@asynccontextmanager
+async def db_connection():
+    """Database connection context manager with semaphore"""
+    async with db_semaphore:
+        try:
+            yield supabase
+        except Exception as e:
+            logger.error(f"Database connection error: {e}")
+            raise
+
+async def exponential_backoff_retry(func, max_retries=3, base_delay=1, *args, **kwargs):
+    """Exponential backoff retry wrapper"""
+    for attempt in range(max_retries):
+        try:
+            return await func(*args, **kwargs)
+        except Exception as e:
+            if attempt < max_retries - 1:
+                delay = base_delay * (2 ** attempt)
+                logger.warning(f"Operation failed, retrying in {delay}s (attempt {attempt + 1}/{max_retries}): {e}")
+                await asyncio.sleep(delay)
+            else:
+                logger.error(f"Operation failed after {max_retries} attempts: {e}")
+                raise
+
 async def process_batch_async(batch_id: str, records: List[dict]):
-    """Background task to process large batches"""
+    """Background task to process large batches with connection pooling"""
     try:
         batch_status_store[batch_id]['status'] = 'processing'
         inserted = 0
@@ -100,18 +131,19 @@ async def process_batch_async(batch_id: str, records: List[dict]):
             
             while retry_count < MAX_RETRIES and not batch_success:
                 try:
-                    logger.info(f"Processing chunk {i+1}, attempt {retry_count+1}")
-                    resp = supabase.from_("leads").insert(batch).execute()
-                    if not resp.data:
-                        raise Exception("No data returned from insert")
-                    inserted += len(resp.data)
-                    batch_success = True
-                    logger.info(f"Chunk {i+1} successful: {len(resp.data)} records")
+                    async with db_connection() as db:
+                        logger.info(f"Processing chunk {i+1}, attempt {retry_count+1}")
+                        resp = db.from_("leads").insert(batch).execute()
+                        if not resp.data:
+                            raise Exception("No data returned from insert")
+                        inserted += len(resp.data)
+                        batch_success = True
+                        logger.info(f"Chunk {i+1} successful: {len(resp.data)} records")
                 except Exception as e:
                     retry_count += 1
                     if retry_count < MAX_RETRIES:
                         logger.warning(f"Chunk {i+1} failed, retrying {retry_count}/{MAX_RETRIES}: {str(e)}")
-                        await asyncio.sleep(RETRY_DELAY * retry_count)  # Async sleep
+                        await asyncio.sleep(RETRY_DELAY * retry_count)
                     else:
                         logger.error(f"Chunk {i+1} failed permanently: {str(e)}")
                         failed += len(batch)
@@ -134,7 +166,7 @@ async def process_batch_async(batch_id: str, records: List[dict]):
         batch_status_store[batch_id]['updated_at'] = datetime.utcnow().isoformat()
 
 async def check_duplicates_async(realids: List[str]) -> List[str]:
-    """Async duplicate check in chunks"""
+    """Async duplicate check in chunks with connection pooling"""
     duplicate_check_chunk_size = 1000
     all_conflicts = []
     
@@ -145,31 +177,27 @@ async def check_duplicates_async(realids: List[str]) -> List[str]:
         logger.info(f"Checking duplicates for chunk {chunk_start}-{chunk_end}")
         
         try:
-            existing = supabase \
-                .from_("leads") \
-                .select("realid") \
-                .in_("realid", chunk_realids) \
-                .execute() \
-                .data
-            
-            if existing:
-                chunk_conflicts = [r["realid"] for r in existing]
-                all_conflicts.extend(chunk_conflicts)
+            async with db_connection() as db:
+                existing = db \
+                    .from_("leads") \
+                    .select("realid") \
+                    .in_("realid", chunk_realids) \
+                    .execute() \
+                    .data
                 
+                if existing:
+                    chunk_conflicts = [r["realid"] for r in existing]
+                    all_conflicts.extend(chunk_conflicts)
+                    
         except Exception as e:
             logger.error(f"Duplicate check failed for chunk {chunk_start}-{chunk_end}: {str(e)}")
             raise
     
     return all_conflicts
 
-@router.post("")
-async def create_leads(  # NOW IT'S ASYNC!
-    background_tasks: BackgroundTasks,
-    body: LeadsRequest = Body(...),
-    token=Depends(verify_jwt_token)
-):
+async def process_leads_internal(body: LeadsRequest):
+    """Internal processing logic with connection pooling"""
     count = len(body.leads)
-    logger.info(f"Received request for {count} leads")
     
     if count < 1 or count > MAX_LEADS:
         raise HTTPException(
@@ -177,94 +205,89 @@ async def create_leads(  # NOW IT'S ASYNC!
             detail="Leads API accepts 1 to 100000 records per request"
         )
 
-    try:
-        # Async duplicate check
-        realids = [l.realid for l in body.leads]
-        logger.info("Starting duplicate check...")
-        
-        all_conflicts = await check_duplicates_async(realids)
-        
-        if all_conflicts:
-            logger.warning(f"Found {len(all_conflicts)} duplicate realids")
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail=f"Duplicate realid(s): {all_conflicts}"
-            )
-        
-        logger.info("Duplicate check passed")
-        
-        # Prepare records
-        records = []
-        for l in body.leads:
-            rec = l.dict()
-            if "date" in rec:
-                rec["date"] = to_daterange(rec["date"])
-            records.append(rec)
-        
-        # For large datasets, use background processing
-        if count > 500:  # Adjust threshold based on your needs
-            batch_id = str(uuid.uuid4())
-            batch_status_store[batch_id] = {
-                'batch_id': batch_id,
-                'status': 'processing',
-                'total_records': count,
-                'processed_records': 0,
-                'failed_records': 0,
-                'error_message': None,
-                'created_at': datetime.utcnow().isoformat(),
-                'updated_at': datetime.utcnow().isoformat()
-            }
-            
-            background_tasks.add_task(process_batch_async, batch_id, records)
-            
-            logger.info(f"Started background processing for batch {batch_id}")
-            
-            return JSONResponse(
-                status_code=200,
-                content={
-                    "success": True,
-                    "batch_id": batch_id,
-                    "message": "Batch accepted for processing",
-                    "status_url": f"/api/v2/leads/status/{batch_id}"
-                }
-            )
-        
-        # For smaller datasets, process synchronously
-        else:
-            inserted = 0
-            for batch in chunked(records, CHUNK_SIZE):
-                retry_count = 0
-                batch_success = False
-                
-                while retry_count < MAX_RETRIES and not batch_success:
-                    try:
-                        resp = supabase.from_("leads").insert(batch).execute()
-                        if not resp.data:
-                            raise Exception("No data returned from insert")
-                        inserted += len(resp.data)
-                        batch_success = True
-                    except Exception as e:
-                        retry_count += 1
-                        if retry_count < MAX_RETRIES:
-                            logger.warning(f"Batch failed, retrying {retry_count}/{MAX_RETRIES}: {str(e)}")
-                            await asyncio.sleep(RETRY_DELAY * retry_count)  # Async sleep
-                        else:
-                            raise HTTPException(
-                                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                                detail="Internal server error"
-                            )
-            
-            logger.info(f"Synchronous processing completed: {inserted} records")
-            return {"success": True, "inserted": inserted}
-            
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Unexpected error: {str(e)}")
+    # Async duplicate check with exponential backoff
+    realids = [l.realid for l in body.leads]
+    logger.info("Starting duplicate check...")
+    
+    all_conflicts = await exponential_backoff_retry(check_duplicates_async, 3, 1, realids)
+    
+    if all_conflicts:
+        logger.warning(f"Found {len(all_conflicts)} duplicate realids")
         raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Internal server error"
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Duplicate realid(s): {all_conflicts}"
         )
+    
+    logger.info("Duplicate check passed")
+    
+    # Prepare records
+    records = []
+    for l in body.leads:
+        rec = l.dict()
+        if "date" in rec:
+            rec["date"] = to_daterange(rec["date"])
+        records.append(rec)
+    
+    # Process synchronously for all requests (no background processing)
+    inserted = 0
+    for batch in chunked(records, CHUNK_SIZE):
+        retry_count = 0
+        batch_success = False
+        
+        while retry_count < MAX_RETRIES and not batch_success:
+            try:
+                async with db_connection() as db:
+                    resp = db.from_("leads").insert(batch).execute()
+                    if not resp.data:
+                        raise Exception("No data returned from insert")
+                    inserted += len(resp.data)
+                    batch_success = True
+            except Exception as e:
+                retry_count += 1
+                if retry_count < MAX_RETRIES:
+                    logger.warning(f"Batch failed, retrying {retry_count}/{MAX_RETRIES}: {str(e)}")
+                    await asyncio.sleep(RETRY_DELAY * retry_count)
+                else:
+                    raise HTTPException(
+                        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                        detail="Internal server error"
+                    )
+    
+    logger.info(f"Synchronous processing completed: {inserted} records")
+    return {"success": True, "inserted": inserted}
+
+@router.post("")
+async def create_leads(
+    background_tasks: BackgroundTasks,
+    body: LeadsRequest = Body(...),
+    token=Depends(verify_jwt_token)
+):
+    """Main endpoint with request semaphore and connection pooling"""
+    async with request_semaphore:
+        request_start = datetime.utcnow()
+        logger.info(f"Processing request for {len(body.leads)} leads (semaphore acquired)")
+        
+        try:
+            result = await exponential_backoff_retry(
+                process_leads_internal, 
+                MAX_RETRIES, 
+                RETRY_DELAY, 
+                body
+            )
+            
+            request_duration = (datetime.utcnow() - request_start).total_seconds()
+            logger.info(f"Request completed in {request_duration:.2f}s")
+            
+            return result
+            
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"Unexpected error: {str(e)}")
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Internal server error"
+            )
 
 @router.get("/status/{batch_id}", response_model=BatchStatus)
 async def get_batch_status(batch_id: str):
@@ -272,3 +295,13 @@ async def get_batch_status(batch_id: str):
     if batch_id not in batch_status_store:
         raise HTTPException(status_code=404, detail="Batch not found")
     return batch_status_store[batch_id]
+
+@router.get("/health")
+async def health_check():
+    """Health check endpoint to monitor semaphore status"""
+    return {
+        "status": "healthy",
+        "concurrent_requests_available": request_semaphore._value,
+        "db_connections_available": db_semaphore._value,
+        "active_batches": len(batch_status_store)
+    }
