@@ -1,3 +1,4 @@
+# leads.py
 from fastapi import APIRouter, Depends, HTTPException, Body, status
 from pydantic import BaseModel, Field, EmailStr, conint, validator
 from typing import List, Optional, Literal
@@ -7,6 +8,8 @@ import asyncio
 import logging
 import uuid
 from datetime import datetime
+import aioredis
+import os
 
 from app.core.db import supabase
 from app.core.auth import verify_jwt_token
@@ -14,27 +17,25 @@ from ._schemas import ErrorResponse
 
 router = APIRouter(prefix="/api/v2/leads", tags=["leads"])
 
-# Updated Constants - More realistic limits
+# Constants
 MAX_LEADS = 100000
-CHUNK_SIZE = 1000  # Smaller chunks for better error handling
+CHUNK_SIZE = 1000
 MAX_RETRIES = 3
 RETRY_DELAY = 1
-MAX_CONCURRENT_REQUESTS = 20  # Increased for better throughput
-MAX_DB_CONNECTIONS = 10  # Increased for better concurrency
-DUPLICATE_CHECK_CHUNK_SIZE = 500  # Smaller chunks for parallel processing
+MAX_CONCURRENT_REQUESTS = 20
+MAX_DB_CONNECTIONS = 10
+DUPLICATE_CHECK_CHUNK_SIZE = 500
 
 # Semaphores
 request_semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
 db_semaphore = asyncio.Semaphore(MAX_DB_CONNECTIONS)
 
-# Logger
 logger = logging.getLogger(__name__)
 
-# In-memory batch status with thread-safe operations
-batch_status_store = {}
-status_lock = asyncio.Lock()
+# Redis client
+REDIS_URL = os.getenv("REDIS_URL", "redis://localhost")
+redis = aioredis.from_url(REDIS_URL, decode_responses=True)
 
-# Schemas (keeping your existing schemas)
 class Lead(BaseModel):
     date: str = Field(..., pattern=r'^\d{4}-\d{2}-\d{2}\s*-\s*\d{4}-\d{2}-\d{2}$')
     action_id: str
@@ -91,16 +92,13 @@ class ProcessingResult(BaseModel):
     duplicate_records: int
     error_message: Optional[str] = None
 
-# Helpers
 def chunked(iterable, size):
     for i in range(0, len(iterable), size):
         yield iterable[i:i + size]
 
 def to_daterange(date_str):
     parts = [p.strip() for p in date_str.split(' - ', 1)]
-    if len(parts) == 2:
-        return f"[{parts[0]},{parts[1]}]"
-    return date_str
+    return f"[{parts[0]},{parts[1]}]" if len(parts) == 2 else date_str
 
 @asynccontextmanager
 async def db_connection():
@@ -121,194 +119,102 @@ async def exponential_backoff_retry(func, max_retries=3, base_delay=1, *args, **
                 raise
 
 async def update_batch_status(batch_id: str, **updates):
-    """Thread-safe batch status update"""
-    async with status_lock:
-        if batch_id in batch_status_store:
-            batch_status_store[batch_id].update(updates)
-            batch_status_store[batch_id]['updated_at'] = datetime.utcnow().isoformat()
+    key = f"batch:{batch_id}"
+    updates['updated_at'] = datetime.utcnow().isoformat()
+    await redis.hset(key, mapping=updates)
 
-async def check_duplicates_chunk(realids_chunk: List[str]) -> List[str]:
-    """Check duplicates for a single chunk"""
-    try:
-        async with db_connection() as db:
-            data = db.from_("leads").select("realid").in_("realid", realids_chunk).execute().data
-            return [r["realid"] for r in data] if data else []
-    except Exception as e:
-        logger.error(f"Error checking duplicates for chunk: {e}")
-        return []
+async def get_batch_status_data(batch_id: str):
+    key = f"batch:{batch_id}"
+    data = await redis.hgetall(key)
+    if not data:
+        raise HTTPException(status_code=404, detail="Batch not found")
+    data['total_records'] = int(data['total_records'])
+    data['processed_records'] = int(data['processed_records'])
+    data['failed_records'] = int(data['failed_records'])
+    return data
 
-async def check_duplicates_parallel(realids: List[str]) -> List[str]:
-    """Check duplicates in parallel chunks"""
-    chunks = list(chunked(realids, DUPLICATE_CHECK_CHUNK_SIZE))
-    
-    # Process chunks in parallel
-    tasks = [check_duplicates_chunk(chunk) for chunk in chunks]
-    results = await asyncio.gather(*tasks, return_exceptions=True)
-    
-    conflicts = []
-    for result in results:
-        if isinstance(result, Exception):
-            logger.error(f"Duplicate check failed: {result}")
-            continue
-        conflicts.extend(result)
-    
-    return conflicts
-
-async def insert_chunk_safe(records_chunk: List[dict], batch_id: str) -> dict:
-    """Insert a chunk with proper error handling"""
+async def insert_chunk_safe(records_chunk, batch_id):
     try:
         async with db_connection() as db:
             resp = db.from_("leads").insert(records_chunk).execute()
-            if not resp.data:
-                raise Exception("Insert returned no data")
-            
-            # Update batch status
-            await update_batch_status(
-                batch_id,
-                processed_records=batch_status_store[batch_id]['processed_records'] + len(resp.data)
-            )
-            
-            return {"success": True, "inserted": len(resp.data), "failed": 0}
+            inserted = len(resp.data or [])
+            await update_batch_status(batch_id, processed_records=int(await redis.hget(f"batch:{batch_id}", "processed_records")) + inserted)
+            return {"success": True, "inserted": inserted, "failed": 0}
     except Exception as e:
-        logger.error(f"Failed to insert chunk: {e}")
-        await update_batch_status(
-            batch_id,
-            failed_records=batch_status_store[batch_id]['failed_records'] + len(records_chunk)
-        )
+        await update_batch_status(batch_id, failed_records=int(await redis.hget(f"batch:{batch_id}", "failed_records")) + len(records_chunk))
         return {"success": False, "inserted": 0, "failed": len(records_chunk), "error": str(e)}
 
-async def insert_records_parallel(records: List[dict], batch_id: str) -> dict:
-    """Insert records in parallel chunks"""
+async def insert_records_parallel(records, batch_id):
     chunks = list(chunked(records, CHUNK_SIZE))
-    
-    # Process chunks in parallel with limited concurrency
-    semaphore = asyncio.Semaphore(5)  # Limit parallel inserts
-    
-    async def insert_with_semaphore(chunk):
-        async with semaphore:
-            return await exponential_backoff_retry(insert_chunk_safe, 3, 1, chunk, batch_id)
-    
-    tasks = [insert_with_semaphore(chunk) for chunk in chunks]
+    semaphore = asyncio.Semaphore(5)
+    tasks = [insert_chunk_with_semaphore(chunk, batch_id, semaphore) for chunk in chunks]
     results = await asyncio.gather(*tasks, return_exceptions=True)
-    
-    total_inserted = 0
-    total_failed = 0
-    errors = []
-    
+    inserted, failed, errors = 0, 0, []
     for result in results:
-        if isinstance(result, Exception):
-            logger.error(f"Insert task failed: {result}")
-            errors.append(str(result))
-            continue
-        
-        total_inserted += result.get("inserted", 0)
-        total_failed += result.get("failed", 0)
-        if result.get("error"):
-            errors.append(result["error"])
-    
-    return {
-        "inserted": total_inserted,
-        "failed": total_failed,
-        "errors": errors
-    }
+        if isinstance(result, dict):
+            inserted += result["inserted"]
+            failed += result["failed"]
+            if result.get("error"):
+                errors.append(result["error"])
+    return {"inserted": inserted, "failed": failed, "errors": errors}
 
-async def process_leads_internal(body: LeadsRequest) -> ProcessingResult:
-    """Main processing function with improved error handling"""
+async def insert_chunk_with_semaphore(chunk, batch_id, semaphore):
+    async with semaphore:
+        return await exponential_backoff_retry(insert_chunk_safe, 3, 1, chunk, batch_id)
+
+async def check_duplicates_parallel(realids):
+    chunks = list(chunked(realids, DUPLICATE_CHECK_CHUNK_SIZE))
+    tasks = [check_duplicates_chunk(chunk) for chunk in chunks]
+    results = await asyncio.gather(*tasks)
+    return [item for sublist in results for item in sublist]
+
+async def check_duplicates_chunk(chunk):
+    async with db_connection() as db:
+        data = db.from_("leads").select("realid").in_("realid", chunk).execute().data
+        return [r["realid"] for r in data] if data else []
+
+async def process_leads_internal(body: LeadsRequest):
     batch_id = str(uuid.uuid4())
-    
-    # Initialize batch status
-    async with status_lock:
-        batch_status_store[batch_id] = {
-            'batch_id': batch_id,
-            'status': 'processing',
-            'total_records': len(body.leads),
-            'processed_records': 0,
-            'failed_records': 0,
-            'error_message': None,
-            'created_at': datetime.utcnow().isoformat(),
-            'updated_at': datetime.utcnow().isoformat()
-        }
-    
+    await redis.hset(f"batch:{batch_id}", mapping={
+        "batch_id": batch_id,
+        "status": "processing",
+        "total_records": len(body.leads),
+        "processed_records": 0,
+        "failed_records": 0,
+        "error_message": "",
+        "created_at": datetime.utcnow().isoformat(),
+        "updated_at": datetime.utcnow().isoformat()
+    })
     try:
-        # Check for duplicates in parallel
         realids = [l.realid for l in body.leads]
         conflicts = await exponential_backoff_retry(check_duplicates_parallel, 3, 1, realids)
-        
         if conflicts:
-            await update_batch_status(batch_id, status='failed', error_message=f"Duplicate realid(s) found: {len(conflicts)} duplicates")
-            return ProcessingResult(
-                success=False,
-                batch_id=batch_id,
-                total_records=len(body.leads),
-                inserted_records=0,
-                failed_records=len(body.leads),
-                duplicate_records=len(conflicts),
-                error_message=f"Duplicate realid(s): {conflicts[:10]}"
-            )
-        
-        # Prepare records
+            await update_batch_status(batch_id, status="failed", error_message=f"{len(conflicts)} duplicates")
+            return ProcessingResult(False, batch_id, len(body.leads), 0, len(body.leads), len(conflicts), f"Duplicates: {conflicts[:10]}")
         records = [l.dict() for l in body.leads]
         for r in records:
-            if 'date' in r:
-                r['date'] = to_daterange(r['date'])
-        
-        # Insert records in parallel
-        insert_result = await insert_records_parallel(records, batch_id)
-        
-        # Update final status
-        success = insert_result["failed"] == 0
-        await update_batch_status(
-            batch_id,
-            status='completed' if success else 'failed',
-            error_message='; '.join(insert_result["errors"]) if insert_result["errors"] else None
-        )
-        
-        return ProcessingResult(
-            success=success,
-            batch_id=batch_id,
-            total_records=len(body.leads),
-            inserted_records=insert_result["inserted"],
-            failed_records=insert_result["failed"],
-            duplicate_records=0,
-            error_message='; '.join(insert_result["errors"]) if insert_result["errors"] else None
-        )
-        
+            r["date"] = to_daterange(r["date"])
+        result = await insert_records_parallel(records, batch_id)
+        await update_batch_status(batch_id, status="completed" if result["failed"] == 0 else "failed", error_message="; ".join(result["errors"]))
+        return ProcessingResult(result["failed"] == 0, batch_id, len(body.leads), result["inserted"], result["failed"], 0, "; ".join(result["errors"]))
     except Exception as e:
-        await update_batch_status(batch_id, status='failed', error_message=str(e))
-        logger.error(f"Processing failed for batch {batch_id}: {e}")
-        return ProcessingResult(
-            success=False,
-            batch_id=batch_id,
-            total_records=len(body.leads),
-            inserted_records=0,
-            failed_records=len(body.leads),
-            duplicate_records=0,
-            error_message=str(e)
-        )
+        await update_batch_status(batch_id, status="failed", error_message=str(e))
+        return ProcessingResult(False, batch_id, len(body.leads), 0, len(body.leads), 0, str(e))
 
 @router.post("", response_model=ProcessingResult)
-async def create_leads(
-    body: LeadsRequest = Body(...),
-    token=Depends(verify_jwt_token)
-):
-    """Process leads with improved concurrency handling"""
+async def create_leads(body: LeadsRequest = Body(...), token=Depends(verify_jwt_token)):
     async with request_semaphore:
         return await process_leads_internal(body)
 
 @router.get("/status/{batch_id}", response_model=BatchStatus)
 async def get_batch_status(batch_id: str):
-    """Get batch processing status"""
-    async with status_lock:
-        if batch_id not in batch_status_store:
-            raise HTTPException(status_code=404, detail="Batch not found")
-        return BatchStatus(**batch_status_store[batch_id])
+    data = await get_batch_status_data(batch_id)
+    return BatchStatus(**data)
 
 @router.get("/health")
 async def health_check():
-    """Health check endpoint"""
     return {
         "status": "healthy",
-        "available_request_slots": request_semaphore._value,
-        "available_db_connections": db_semaphore._value,
-        "active_batches": len(batch_status_store)
+        "request_slots": request_semaphore._value,
+        "db_slots": db_semaphore._value
     }
