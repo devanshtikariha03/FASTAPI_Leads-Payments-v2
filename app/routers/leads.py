@@ -107,8 +107,8 @@ def batch_insert(records: List[dict], batch_size: int = BATCH_SIZE) -> tuple[int
     
     return total_inserted, total_failed
 
-@router.post("/bulk", response_model=ChunkResponse)
-async def create_leads_bulk(
+@router.post("", response_model=ChunkResponse)
+async def create_leads(
     body: LeadsChunk = Body(...),
     token=Depends(verify_jwt_token)
 ):
