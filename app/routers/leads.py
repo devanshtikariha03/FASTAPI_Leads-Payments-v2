@@ -80,13 +80,25 @@ def prepare_record(lead: Lead) -> dict:
     return record
 
 def check_duplicates(realids: List[str]) -> List[str]:
-    """Check for existing realids in database"""
+    """Check for existing realids in database with chunking to avoid parameter limits"""
+    if not realids:
+        return []
+    
+    # Split into chunks of 500 to avoid PostgreSQL parameter size limits
+    chunk_size = 500
+    all_duplicates = []
+    
     try:
-        response = supabase.from_("leads").select("realid").in_("realid", realids).execute()
-        return [row["realid"] for row in response.data] if response.data else []
+        for i in range(0, len(realids), chunk_size):
+            chunk = realids[i:i + chunk_size]
+            response = supabase.from_("leads").select("realid").in_("realid", chunk).execute()
+            if response.data:
+                all_duplicates.extend([row["realid"] for row in response.data])
+        
+        return all_duplicates
     except Exception as e:
         logger.error(f"Error checking duplicates: {e}")
-        raise HTTPException(status_code=500, detail="Error checking duplicates")
+        raise HTTPException(status_code=500, detail=f"Error checking duplicates: {str(e)}")
 
 def batch_insert(records: List[dict], batch_size: int = BATCH_SIZE) -> tuple[int, int]:
     """Insert records in batches to avoid memory issues"""
