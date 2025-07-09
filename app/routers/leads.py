@@ -13,7 +13,7 @@ router = APIRouter(prefix="/api/v2/leads", tags=["leads"])
 
 # Simple configuration
 MAX_CHUNK_SIZE = 5000
-BATCH_SIZE = 1000  # Size for database batch inserts
+BATCH_SIZE = 500  # Size for database batch inserts
 
 # Logger
 logger = logging.getLogger(__name__)
@@ -85,7 +85,7 @@ def check_duplicates(realids: List[str]) -> List[str]:
         return []
     
     # Split into chunks of 500 to avoid PostgreSQL parameter size limits
-    chunk_size = 500
+    chunk_size = 1000
     all_duplicates = []
     
     try:
