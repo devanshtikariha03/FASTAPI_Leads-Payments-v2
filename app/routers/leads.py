@@ -21,7 +21,7 @@ MAX_RETRIES = 3
 RETRY_DELAY = 1
 
 # Rate limiting and connection pooling
-MAX_CONCURRENT_REQUESTS = 2  # Adjust based on your Azure limits
+MAX_CONCURRENT_REQUESTS = 4  # Adjust based on your Azure limits
 MAX_DB_CONNECTIONS = 3       # Adjust based on your database capacity
 request_semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
 db_semaphore = asyncio.Semaphore(MAX_DB_CONNECTIONS)
