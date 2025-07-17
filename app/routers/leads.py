@@ -222,7 +222,7 @@ async def create_leads(
         logger.error(f"Failed to queue job: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to queue job {e}"
+            detail=f"Failed to queue job {str(e)}"
         )
 
 @router.get("/status/{job_id}")
