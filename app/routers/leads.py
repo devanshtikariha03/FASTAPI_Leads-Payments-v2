@@ -274,7 +274,7 @@ async def get_user_jobs(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to get user jobs"
         )
-
+@router.get("/health")
 async def health_check():
     """Simple health check endpoint with server info"""
     server_info = sys.argv[0]
