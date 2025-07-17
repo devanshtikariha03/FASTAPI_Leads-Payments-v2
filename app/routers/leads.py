@@ -182,6 +182,32 @@ async def process_leads_background(job_id: str, leads: List[Lead], user_id: str)
         except Exception as update_error:
             logger.error(f"Failed to update job status to failed: {update_error}")
 
+@router.post("/fast", response_model=JobResponse)
+async def create_leads_ultra_fast(
+    background_tasks: BackgroundTasks,
+    body: LeadsChunk = Body(...),
+    token=Depends(verify_jwt_token)
+):
+    """Ultra-fast endpoint - minimal validation, immediate response"""
+    
+    # MINIMAL validation - only check chunk size
+    leads_count = len(body.leads)
+    if leads_count > MAX_CHUNK_SIZE:
+        raise HTTPException(status_code=400, detail="Chunk too large")
+    
+    # Generate job ID and queue task
+    job_id = str(uuid.uuid4())
+    background_tasks.add_task(process_leads_background, job_id, body.leads, token.get("sub"))
+    
+    # IMMEDIATE response
+    return JobResponse(
+        job_id=job_id,
+        status="received",
+        message="Queued",
+        received_count=leads_count,
+        timestamp=datetime.utcnow()
+    )
+
 @router.post("", response_model=JobResponse)
 async def create_leads(
     background_tasks: BackgroundTasks,
@@ -190,42 +216,33 @@ async def create_leads(
 ):
     """Queue leads for processing and return job ID immediately"""
     
-    # 1) Validate input
+    # 1) Validate input - ONLY basic validation
     if len(body.leads) > MAX_CHUNK_SIZE:
         raise HTTPException(
             status_code=400, 
             detail=f"Chunk size {len(body.leads)} exceeds maximum {MAX_CHUNK_SIZE}"
         )
     
-    # 2) Create job_id
+    # 2) Create job_id - FAST operation
     job_id = str(uuid.uuid4())
     user_id = token.get("sub")  # Get user ID from JWT token
     
-    # 3) Return response immediately
-    try:
-        # Queue background processing - NO WAITING, NO DATABASE OPERATIONS
-        background_tasks.add_task(
-            process_leads_background,
-            job_id,
-            body.leads,
-            user_id
-        )
-        
-        # IMMEDIATE response - no processing done yet
-        return JobResponse(
-            job_id=job_id,
-            status="received",
-            message="Leads received and queued for processing",
-            received_count=len(body.leads),
-            timestamp=datetime.utcnow()
-        )
-        
-    except Exception as e:
-        logger.error(f"Failed to queue job: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to queue job"
-        )
+    # 3) Queue background task - NO WAITING
+    background_tasks.add_task(
+        process_leads_background,
+        job_id,
+        body.leads,
+        user_id
+    )
+    
+    # 4) Return response immediately - NO database operations, NO processing
+    return JobResponse(
+        job_id=job_id,
+        status="received",
+        message="Leads received and queued for processing",
+        received_count=len(body.leads),
+        timestamp=datetime.utcnow()
+    )
 
 @router.get("/status/{job_id}")
 async def get_job_status(
