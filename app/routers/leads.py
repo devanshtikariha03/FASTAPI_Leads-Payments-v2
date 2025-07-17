@@ -5,7 +5,7 @@ import logging
 import time
 import uuid
 from datetime import datetime
-import sys
+
 from app.core.db import supabase
 from app.core.auth import verify_jwt_token
 from ._schemas import ErrorResponse
@@ -77,44 +77,56 @@ def prepare_record(lead: Lead) -> dict:
         record['date'] = to_daterange(record['date'])
     return record
 
-def check_duplicates(realids: List[str]) -> List[str]:
-    """Check for existing realids in database with chunking"""
-    if not realids:
-        return []
-    
-    chunk_size = 1000
-    all_duplicates = []
-    
-    try:
-        for i in range(0, len(realids), chunk_size):
-            chunk = realids[i:i + chunk_size]
-            response = supabase.from_("leads").select("realid").in_("realid", chunk).execute()
-            if response.data:
-                all_duplicates.extend([row["realid"] for row in response.data])
-        
-        return all_duplicates
-    except Exception as e:
-        logger.error(f"Error checking duplicates: {e}")
-        return []  # Return empty list instead of raising exception
+@router.post("", response_model=JobResponse)
+async def create_leads(
+    background_tasks: BackgroundTasks,
+    body: LeadsChunk = Body(...),
+    token=Depends(verify_jwt_token)
+):
+    start = time.time()
+    logger.info(f"[ENTRY] Received {len(body.leads)} leads.")
 
-def batch_insert(records: List[dict], batch_size: int = BATCH_SIZE) -> tuple[int, int]:
-    """Insert records in batches"""
-    total_inserted = 0
-    total_failed = 0
-    
-    for i in range(0, len(records), batch_size):
-        batch = records[i:i + batch_size]
-        try:
-            response = supabase.from_("leads").insert(batch).execute()
-            if response.data:
-                total_inserted += len(response.data)
-            else:
-                total_failed += len(batch)
-        except Exception as e:
-            logger.error(f"Batch insert failed: {e}")
-            total_failed += len(batch)
-    
-    return total_inserted, total_failed
+    job_id = str(uuid.uuid4())
+    user_id = token.get("sub")
+
+    try:
+        job_record = {
+            "job_id": job_id,
+            "status": "received",
+            "total_records": len(body.leads),
+            "user_id": user_id,
+            "chunk_size": len(body.leads),
+            "batch_size": BATCH_SIZE
+        }
+
+        logger.info("[DB] Inserting job record to Supabase...")
+        db_start = time.time()
+        supabase.from_("job_status").insert(job_record).execute()
+        logger.info(f"[DB] Insert completed in {time.time() - db_start:.2f}s.")
+
+        # Add background task
+        logger.info("[BG] Queuing background task for processing...")
+        bg_start = time.time()
+        background_tasks.add_task(process_leads_async, job_id, body.leads, user_id)
+        logger.info(f"[BG] Background task queued in {time.time() - bg_start:.2f}s.")
+
+        total_time = time.time() - start
+        logger.info(f"[DONE] Responding to client in {total_time:.2f}s.")
+
+        return JobResponse(
+            job_id=job_id,
+            status="received",
+            message="Leads received and queued for processing",
+            received_count=len(body.leads),
+            timestamp=datetime.utcnow()
+        )
+
+    except Exception as e:
+        logger.error(f"[ERROR] Failed to queue job: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to queue job: {str(e)}"
+        )
 
 async def process_leads_async(job_id: str, leads: List[Lead], user_id: str):
     """Process leads asynchronously and update job status"""
@@ -274,17 +286,13 @@ async def get_user_jobs(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to get user jobs"
         )
+
 @router.get("/health")
 async def health_check():
-    """Simple health check endpoint with server info"""
-    server_info = sys.argv[0]
-    is_uvicorn = "uvicorn" in server_info.lower()
-
+    """Simple health check endpoint"""
     return {
         "status": "healthy",
         "max_chunk_size": MAX_CHUNK_SIZE,
         "batch_size": BATCH_SIZE,
-        "timestamp": datetime.utcnow().isoformat(),
-        "server_info": server_info,
-        "is_uvicorn": is_uvicorn
+        "timestamp": datetime.utcnow().isoformat()
     }
