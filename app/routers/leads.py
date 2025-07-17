@@ -116,18 +116,27 @@ def batch_insert(records: List[dict], batch_size: int = BATCH_SIZE) -> tuple[int
     
     return total_inserted, total_failed
 
-async def process_leads_async(job_id: str, leads: List[Lead], user_id: str):
-    """Process leads asynchronously and update job status"""
+async def process_leads_background(job_id: str, leads: List[Lead], user_id: str):
+    """Background task that handles job record creation AND lead processing"""
     try:
-        # Update status to processing
-        supabase.from_("job_status").update({
+        # 1) Insert job record to Supabase
+        job_record = {
+            "job_id": job_id,
             "status": "processing",
+            "total_records": len(leads),
+            "user_id": user_id,
+            "chunk_size": len(leads),
+            "batch_size": BATCH_SIZE,
             "processing_started_at": datetime.utcnow().isoformat()
-        }).eq("job_id", job_id).execute()
+        }
         
+        supabase.from_("job_status").insert(job_record).execute()
+        logger.info(f"Job {job_id} record created and processing started")
+        
+        # 2) Process leads
         start_time = time.time()
         
-        # Check duplicates (NOW moved to background)
+        # Check duplicates
         realids = [lead.realid for lead in leads]
         existing_realids = check_duplicates(realids)
         duplicate_count = len(existing_realids)
@@ -163,11 +172,15 @@ async def process_leads_async(job_id: str, leads: List[Lead], user_id: str):
         
     except Exception as e:
         logger.error(f"Background processing failed for job {job_id}: {e}")
-        supabase.from_("job_status").update({
-            "status": "failed",
-            "error_message": str(e),
-            "processing_completed_at": datetime.utcnow().isoformat()
-        }).eq("job_id", job_id).execute()
+        # Try to update job status to failed, but don't crash if it fails
+        try:
+            supabase.from_("job_status").update({
+                "status": "failed",
+                "error_message": str(e),
+                "processing_completed_at": datetime.utcnow().isoformat()
+            }).eq("job_id", job_id).execute()
+        except Exception as update_error:
+            logger.error(f"Failed to update job status to failed: {update_error}")
 
 @router.post("", response_model=JobResponse)
 async def create_leads(
@@ -176,32 +189,23 @@ async def create_leads(
     token=Depends(verify_jwt_token)
 ):
     """Queue leads for processing and return job ID immediately"""
+    
+    # 1) Validate input
+    if len(body.leads) > MAX_CHUNK_SIZE:
+        raise HTTPException(
+            status_code=400, 
+            detail=f"Chunk size {len(body.leads)} exceeds maximum {MAX_CHUNK_SIZE}"
+        )
+    
+    # 2) Create job_id
     job_id = str(uuid.uuid4())
     user_id = token.get("sub")  # Get user ID from JWT token
     
+    # 3) Return response immediately
     try:
-        # ONLY basic validation - NO heavy processing
-        if len(body.leads) > MAX_CHUNK_SIZE:
-            raise HTTPException(
-                status_code=400, 
-                detail=f"Chunk size {len(body.leads)} exceeds maximum {MAX_CHUNK_SIZE}"
-            )
-        
-        # Create initial job record - FAST operation
-        job_record = {
-            "job_id": job_id,
-            "status": "received",
-            "total_records": len(body.leads),
-            "user_id": user_id,
-            "chunk_size": len(body.leads),
-            "batch_size": BATCH_SIZE
-        }
-        
-        supabase.from_("job_status").insert(job_record).execute()
-        
-        # Queue background processing - NO WAITING
+        # Queue background processing - NO WAITING, NO DATABASE OPERATIONS
         background_tasks.add_task(
-            process_leads_async,
+            process_leads_background,
             job_id,
             body.leads,
             user_id
@@ -216,8 +220,6 @@ async def create_leads(
             timestamp=datetime.utcnow()
         )
         
-    except HTTPException:
-        raise
     except Exception as e:
         logger.error(f"Failed to queue job: {e}")
         raise HTTPException(
