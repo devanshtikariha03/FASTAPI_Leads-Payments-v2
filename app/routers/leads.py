@@ -5,7 +5,7 @@ import logging
 import time
 import uuid
 from datetime import datetime
-
+import sys
 from app.core.db import supabase
 from app.core.auth import verify_jwt_token
 from ._schemas import ErrorResponse
@@ -275,12 +275,16 @@ async def get_user_jobs(
             detail="Failed to get user jobs"
         )
 
-@router.get("/health")
 async def health_check():
-    """Simple health check endpoint"""
+    """Simple health check endpoint with server info"""
+    server_info = sys.argv[0]
+    is_uvicorn = "uvicorn" in server_info.lower()
+
     return {
         "status": "healthy",
         "max_chunk_size": MAX_CHUNK_SIZE,
         "batch_size": BATCH_SIZE,
-        "timestamp": datetime.utcnow().isoformat()
+        "timestamp": datetime.utcnow().isoformat(),
+        "server_info": server_info,
+        "is_uvicorn": is_uvicorn
     }
