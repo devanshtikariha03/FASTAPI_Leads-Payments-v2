@@ -8,6 +8,8 @@ import asyncio
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
 import threading
+import random
+from dataclasses import dataclass
 
 from app.core.db import supabase
 from app.core.auth import verify_jwt_token
@@ -21,6 +23,12 @@ BATCH_SIZE = 5000
 MAX_CONCURRENT_BACKGROUND_TASKS = 3  # Limit concurrent background tasks
 MAX_DB_CONNECTIONS = 10  # Limit database connections
 
+# Retry Configuration - Optimized for speed
+MAX_RETRIES = 2  # Reduced from 3 to 2 for faster processing
+RETRY_DELAY_BASE = 0.5  # Reduced from 1s to 0.5s for faster retries
+RETRY_DELAY_MAX = 8  # Reduced from 16s to 8s maximum delay
+RETRY_BACKOFF_MULTIPLIER = 2  # Exponential backoff multiplier
+
 # Logger
 logger = logging.getLogger(__name__)
 
@@ -33,6 +41,17 @@ thread_pool = ThreadPoolExecutor(max_workers=5)
 
 # Lock for database operations
 db_lock = threading.Lock()
+
+@dataclass
+class RetryStats:
+    total_attempts: int = 0
+    successful_retries: int = 0
+    failed_after_retries: int = 0
+    retry_delays: List[float] = None
+    
+    def __post_init__(self):
+        if self.retry_delays is None:
+            self.retry_delays = []
 
 class Lead(BaseModel):
     date: str = Field(..., pattern=r'^\d{4}-\d{2}-\d{2}\s*-\s*\d{4}-\d{2}-\d{2}$')
@@ -78,6 +97,34 @@ class JobResponse(BaseModel):
     received_count: int
     timestamp: datetime
 
+def calculate_retry_delay(attempt: int, base_delay: float = RETRY_DELAY_BASE) -> float:
+    """Calculate exponential backoff delay with jitter - optimized for speed"""
+    delay = min(base_delay * (RETRY_BACKOFF_MULTIPLIER ** attempt), RETRY_DELAY_MAX)
+    # Reduced jitter for faster processing
+    jitter = random.uniform(0.05, 0.15) * delay
+    return delay + jitter
+
+def is_retryable_error(error: Exception) -> bool:
+    """Determine if an error is retryable"""
+    error_msg = str(error).lower()
+    retryable_patterns = [
+        'timeout',
+        'connection',
+        'network',
+        'temporary',
+        'rate limit',
+        'server error',
+        'service unavailable',
+        'too many requests',
+        'deadlock',
+        'lock timeout',
+        'connection reset',
+        'read timeout',
+        'write timeout'
+    ]
+    
+    return any(pattern in error_msg for pattern in retryable_patterns)
+
 def to_daterange(date_str: str) -> str:
     """Convert date string to PostgreSQL daterange format"""
     parts = [p.strip() for p in date_str.split(' - ', 1)]
@@ -103,70 +150,190 @@ async def safe_db_operation(operation_func, *args, **kwargs):
             logger.error(f"Database operation failed: {e}")
             raise
 
-def sync_check_duplicates(realids: List[str]) -> List[str]:
-    """Check for existing realids in database with chunking - sync version"""
+def sync_check_duplicates_with_retry(realids: List[str]) -> tuple[List[str], RetryStats]:
+    """Check for existing realids in database with retry mechanism"""
     if not realids:
-        return []
+        return [], RetryStats()
     
-    chunk_size = 500  # Smaller chunks for better performance
+    retry_stats = RetryStats()
+    chunk_size = 500
     all_duplicates = []
     
-    try:
-        for i in range(0, len(realids), chunk_size):
-            chunk = realids[i:i + chunk_size]
-            response = supabase.from_("leads").select("realid").in_("realid", chunk).execute()
-            if response.data:
-                all_duplicates.extend([row["realid"] for row in response.data])
+    for i in range(0, len(realids), chunk_size):
+        chunk = realids[i:i + chunk_size]
         
-        return all_duplicates
-    except Exception as e:
-        logger.error(f"Error checking duplicates: {e}")
-        return []
+        for attempt in range(MAX_RETRIES + 1):
+            try:
+                retry_stats.total_attempts += 1
+                response = supabase.from_("leads").select("realid").in_("realid", chunk).execute()
+                
+                if response.data:
+                    all_duplicates.extend([row["realid"] for row in response.data])
+                
+                if attempt > 0:
+                    retry_stats.successful_retries += 1
+                    logger.info(f"Duplicate check succeeded on attempt {attempt + 1}")
+                
+                break  # Success, break retry loop
+                
+            except Exception as e:
+                logger.warning(f"Duplicate check attempt {attempt + 1} failed: {e}")
+                
+                if attempt == MAX_RETRIES:
+                    # Final attempt failed
+                    retry_stats.failed_after_retries += 1
+                    logger.error(f"Duplicate check failed after {MAX_RETRIES + 1} attempts: {e}")
+                    # Continue with next chunk instead of failing completely
+                    break
+                
+                if is_retryable_error(e):
+                    delay = calculate_retry_delay(attempt)
+                    retry_stats.retry_delays.append(delay)
+                    logger.info(f"Retrying duplicate check in {delay:.2f} seconds...")
+                    time.sleep(delay)
+                else:
+                    # Non-retryable error, fail immediately
+                    retry_stats.failed_after_retries += 1
+                    logger.error(f"Non-retryable error in duplicate check: {e}")
+                    break
+    
+    return all_duplicates, retry_stats
 
-def sync_batch_insert(records: List[dict], batch_size: int = BATCH_SIZE) -> tuple[int, int]:
-    """Insert records in batches - sync version"""
+def sync_batch_insert_with_retry(records: List[dict], batch_size: int = BATCH_SIZE) -> tuple[int, int, RetryStats]:
+    """Insert records in batches with retry mechanism"""
     total_inserted = 0
     total_failed = 0
+    retry_stats = RetryStats()
     
-    # Use smaller batches for better performance
-    actual_batch_size = min(batch_size, 100)
+    # Use even smaller batches for better performance and reliability
+    actual_batch_size = min(batch_size, 50)  # Reduced from 100 to 50
     
     for i in range(0, len(records), actual_batch_size):
         batch = records[i:i + actual_batch_size]
-        try:
-            response = supabase.from_("leads").insert(batch).execute()
-            if response.data:
-                total_inserted += len(response.data)
-            else:
-                total_failed += len(batch)
-        except Exception as e:
-            logger.error(f"Batch insert failed: {e}")
-            total_failed += len(batch)
+        batch_inserted = False
+        
+        for attempt in range(MAX_RETRIES + 1):
+            try:
+                retry_stats.total_attempts += 1
+                response = supabase.from_("leads").insert(batch).execute()
+                
+                if response.data:
+                    inserted_count = len(response.data)
+                    total_inserted += inserted_count
+                    logger.debug(f"Batch {i//actual_batch_size + 1} inserted {inserted_count} records")
+                else:
+                    # No data returned but no error - treat as failure
+                    total_failed += len(batch)
+                    logger.warning(f"Batch {i//actual_batch_size + 1} returned no data")
+                
+                if attempt > 0:
+                    retry_stats.successful_retries += 1
+                    logger.info(f"Batch insert succeeded on attempt {attempt + 1}")
+                
+                batch_inserted = True
+                break  # Success, break retry loop
+                
+            except Exception as e:
+                logger.warning(f"Batch insert attempt {attempt + 1} failed: {e}")
+                
+                if attempt == MAX_RETRIES:
+                    # Final attempt failed
+                    retry_stats.failed_after_retries += 1
+                    total_failed += len(batch)
+                    logger.error(f"Batch insert failed after {MAX_RETRIES + 1} attempts: {e}")
+                    break
+                
+                if is_retryable_error(e):
+                    delay = calculate_retry_delay(attempt)
+                    retry_stats.retry_delays.append(delay)
+                    logger.info(f"Retrying batch insert in {delay:.2f} seconds...")
+                    time.sleep(delay)
+                else:
+                    # Non-retryable error, fail immediately
+                    retry_stats.failed_after_retries += 1
+                    total_failed += len(batch)
+                    logger.error(f"Non-retryable error in batch insert: {e}")
+                    break
+        
+        if not batch_inserted:
+            logger.error(f"Batch {i//actual_batch_size + 1} completely failed")
     
-    return total_inserted, total_failed
+    return total_inserted, total_failed, retry_stats
 
-def sync_update_job_status(job_id: str, update_data: dict):
-    """Update job status - sync version"""
-    try:
-        supabase.from_("job_status").update(update_data).eq("job_id", job_id).execute()
-    except Exception as e:
-        logger.error(f"Failed to update job status: {e}")
+def sync_update_job_status_with_retry(job_id: str, update_data: dict) -> bool:
+    """Update job status with retry mechanism"""
+    retry_stats = RetryStats()
+    
+    for attempt in range(MAX_RETRIES + 1):
+        try:
+            retry_stats.total_attempts += 1
+            supabase.from_("job_status").update(update_data).eq("job_id", job_id).execute()
+            
+            if attempt > 0:
+                retry_stats.successful_retries += 1
+                logger.info(f"Job status update succeeded on attempt {attempt + 1}")
+            
+            return True  # Success
+            
+        except Exception as e:
+            logger.warning(f"Job status update attempt {attempt + 1} failed: {e}")
+            
+            if attempt == MAX_RETRIES:
+                logger.error(f"Job status update failed after {MAX_RETRIES + 1} attempts: {e}")
+                return False
+            
+            if is_retryable_error(e):
+                delay = calculate_retry_delay(attempt)
+                retry_stats.retry_delays.append(delay)
+                logger.info(f"Retrying job status update in {delay:.2f} seconds...")
+                time.sleep(delay)
+            else:
+                logger.error(f"Non-retryable error in job status update: {e}")
+                return False
+    
+    return False
 
-def sync_insert_job_record(job_record: dict):
-    """Insert job record - sync version"""
-    try:
-        supabase.from_("job_status").insert(job_record).execute()
-    except Exception as e:
-        logger.error(f"Failed to insert job record: {e}")
+def sync_insert_job_record_with_retry(job_record: dict) -> bool:
+    """Insert job record with retry mechanism"""
+    retry_stats = RetryStats()
+    
+    for attempt in range(MAX_RETRIES + 1):
+        try:
+            retry_stats.total_attempts += 1
+            supabase.from_("job_status").insert(job_record).execute()
+            
+            if attempt > 0:
+                retry_stats.successful_retries += 1
+                logger.info(f"Job record insert succeeded on attempt {attempt + 1}")
+            
+            return True  # Success
+            
+        except Exception as e:
+            logger.warning(f"Job record insert attempt {attempt + 1} failed: {e}")
+            
+            if attempt == MAX_RETRIES:
+                logger.error(f"Job record insert failed after {MAX_RETRIES + 1} attempts: {e}")
+                return False
+            
+            if is_retryable_error(e):
+                delay = calculate_retry_delay(attempt)
+                retry_stats.retry_delays.append(delay)
+                logger.info(f"Retrying job record insert in {delay:.2f} seconds...")
+                time.sleep(delay)
+            else:
+                logger.error(f"Non-retryable error in job record insert: {e}")
+                return False
+    
+    return False
 
 async def process_leads_background(job_id: str, leads: List[Lead], user_id: str):
-    """Background task with concurrency control and optimization"""
+    """Background task with comprehensive retry mechanisms"""
     # Wait for semaphore slot
     async with background_semaphore:
         logger.info(f"Job {job_id} acquired semaphore slot, starting processing...")
         
         try:
-            # 1) Insert job record - async wrapped
+            # 1) Insert job record with retry
             job_record = {
                 "job_id": job_id,
                 "status": "processing",
@@ -177,12 +344,16 @@ async def process_leads_background(job_id: str, leads: List[Lead], user_id: str)
                 "processing_started_at": datetime.utcnow().isoformat()
             }
             
-            await safe_db_operation(sync_insert_job_record, job_record)
+            job_record_inserted = await safe_db_operation(sync_insert_job_record_with_retry, job_record)
+            if not job_record_inserted:
+                logger.error(f"Job {job_id} failed to insert job record after retries")
+                return
+            
             logger.info(f"Job {job_id} record created and processing started")
             
             # 2) Validate chunk size
             if len(leads) > MAX_CHUNK_SIZE:
-                await safe_db_operation(sync_update_job_status, job_id, {
+                await safe_db_operation(sync_update_job_status_with_retry, job_id, {
                     "status": "failed",
                     "error_message": f"Chunk size {len(leads)} exceeds maximum {MAX_CHUNK_SIZE}",
                     "processing_completed_at": datetime.utcnow().isoformat(),
@@ -191,48 +362,69 @@ async def process_leads_background(job_id: str, leads: List[Lead], user_id: str)
                 logger.error(f"Job {job_id} failed: chunk size validation")
                 return
             
-            # 3) Process leads with timing
+            # 3) Process leads with timing and retry stats
             start_time = time.time()
             
-            # Check duplicates - async wrapped
+            # Check duplicates with retry
             realids = [lead.realid for lead in leads]
-            existing_realids = await safe_db_operation(sync_check_duplicates, realids)
+            existing_realids, duplicate_retry_stats = await safe_db_operation(
+                sync_check_duplicates_with_retry, realids
+            )
             duplicate_count = len(existing_realids)
             
             if duplicate_count > 0:
-                await safe_db_operation(sync_update_job_status, job_id, {
+                await safe_db_operation(sync_update_job_status_with_retry, job_id, {
                     "status": "completed_with_duplicates",
                     "duplicate_count": duplicate_count,
                     "failed_count": len(leads),
                     "error_message": f"Found {duplicate_count} duplicate realid(s)",
                     "processing_completed_at": datetime.utcnow().isoformat(),
-                    "processing_time": time.time() - start_time
+                    "processing_time": time.time() - start_time,
+                    "retry_stats": {
+                        "duplicate_check_attempts": duplicate_retry_stats.total_attempts,
+                        "duplicate_check_retries": duplicate_retry_stats.successful_retries,
+                        "duplicate_check_failures": duplicate_retry_stats.failed_after_retries
+                    }
                 })
                 logger.warning(f"Job {job_id} completed with {duplicate_count} duplicates")
                 return
             
-            # Process records - async wrapped
+            # Process records with retry
             records = [prepare_record(lead) for lead in leads]
-            inserted_count, failed_count = await safe_db_operation(sync_batch_insert, records)
+            inserted_count, failed_count, insert_retry_stats = await safe_db_operation(
+                sync_batch_insert_with_retry, records
+            )
             
-            # Update final status
+            # Update final status with retry statistics
             final_status = "completed" if failed_count == 0 else "completed_with_failures"
-            await safe_db_operation(sync_update_job_status, job_id, {
+            final_update_data = {
                 "status": final_status,
                 "processed_count": inserted_count,
                 "failed_count": failed_count,
-                "error_message": "Some records failed to insert" if failed_count > 0 else None,
+                "error_message": "Some records failed to insert after retries" if failed_count > 0 else None,
                 "processing_completed_at": datetime.utcnow().isoformat(),
-                "processing_time": time.time() - start_time
-            })
+                "processing_time": time.time() - start_time,
+                "retry_stats": {
+                    "total_attempts": duplicate_retry_stats.total_attempts + insert_retry_stats.total_attempts,
+                    "successful_retries": duplicate_retry_stats.successful_retries + insert_retry_stats.successful_retries,
+                    "failed_after_retries": duplicate_retry_stats.failed_after_retries + insert_retry_stats.failed_after_retries,
+                    "duplicate_check_attempts": duplicate_retry_stats.total_attempts,
+                    "insert_attempts": insert_retry_stats.total_attempts,
+                    "total_retry_delays": len(duplicate_retry_stats.retry_delays) + len(insert_retry_stats.retry_delays)
+                }
+            }
             
-            logger.info(f"Job {job_id} completed: {inserted_count} inserted, {failed_count} failed")
+            await safe_db_operation(sync_update_job_status_with_retry, job_id, final_update_data)
+            
+            logger.info(f"Job {job_id} completed: {inserted_count} inserted, {failed_count} failed, "
+                       f"{insert_retry_stats.successful_retries} successful retries, "
+                       f"{insert_retry_stats.failed_after_retries} failed after retries")
             
         except Exception as e:
             logger.error(f"Background processing failed for job {job_id}: {e}")
-            # Try to update job status to failed
+            # Try to update job status to failed with retry
             try:
-                await safe_db_operation(sync_update_job_status, job_id, {
+                await safe_db_operation(sync_update_job_status_with_retry, job_id, {
                     "status": "failed",
                     "error_message": str(e),
                     "processing_completed_at": datetime.utcnow().isoformat()
@@ -261,7 +453,7 @@ async def create_leads_ultra_fast(
     return JobResponse(
         job_id=job_id,
         status="received",
-        message="Queued for processing",
+        message="Queued for processing with retry mechanism",
         received_count=leads_count,
         timestamp=datetime.utcnow()
     )
@@ -297,7 +489,7 @@ async def create_leads(
     return JobResponse(
         job_id=job_id,
         status="received",
-        message="Leads received and queued for processing",
+        message="Leads received and queued for processing with retry mechanism",
         received_count=len(body.leads),
         timestamp=datetime.utcnow() 
     )
@@ -368,6 +560,12 @@ async def health_check():
         "batch_size": BATCH_SIZE,
         "max_concurrent_tasks": MAX_CONCURRENT_BACKGROUND_TASKS,
         "max_db_connections": MAX_DB_CONNECTIONS,
+        "retry_config": {
+            "max_retries": MAX_RETRIES,
+            "base_delay": RETRY_DELAY_BASE,
+            "max_delay": RETRY_DELAY_MAX,
+            "backoff_multiplier": RETRY_BACKOFF_MULTIPLIER
+        },
         "timestamp": datetime.utcnow().isoformat()
     }
 
