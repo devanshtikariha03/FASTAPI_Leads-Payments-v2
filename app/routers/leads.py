@@ -17,7 +17,7 @@ router = APIRouter(prefix="/api/v2/leads", tags=["leads"])
 
 # Configuration
 MAX_CHUNK_SIZE = 5000
-BATCH_SIZE = 500
+BATCH_SIZE = 5000
 MAX_CONCURRENT_BACKGROUND_TASKS = 3  # Limit concurrent background tasks
 MAX_DB_CONNECTIONS = 10  # Limit database connections
 
