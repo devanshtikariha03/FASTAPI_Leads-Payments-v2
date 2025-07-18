@@ -133,7 +133,18 @@ async def process_leads_background(job_id: str, leads: List[Lead], user_id: str)
         supabase.from_("job_status").insert(job_record).execute()
         logger.info(f"Job {job_id} record created and processing started")
         
-        # 2) Process leads
+        # 2) Validate chunk size in background
+        if len(leads) > MAX_CHUNK_SIZE:
+            supabase.from_("job_status").update({
+                "status": "failed",
+                "error_message": f"Chunk size {len(leads)} exceeds maximum {MAX_CHUNK_SIZE}",
+                "processing_completed_at": datetime.utcnow().isoformat(),
+                "processing_time": 0
+            }).eq("job_id", job_id).execute()
+            logger.error(f"Job {job_id} failed: chunk size validation")
+            return
+        
+        # 3) Process leads
         start_time = time.time()
         
         # Check duplicates
@@ -182,52 +193,26 @@ async def process_leads_background(job_id: str, leads: List[Lead], user_id: str)
         except Exception as update_error:
             logger.error(f"Failed to update job status to failed: {update_error}")
 
-@router.post("/fast", response_model=JobResponse)
-async def create_leads_ultra_fast(
-    background_tasks: BackgroundTasks,
-    body: LeadsChunk = Body(...),
-    token=Depends(verify_jwt_token)
-):
-    """Ultra-fast endpoint - minimal validation, immediate response"""
-    
-    # MINIMAL validation - only check chunk size
-    leads_count = len(body.leads)
-    if leads_count > MAX_CHUNK_SIZE:
-        raise HTTPException(status_code=400, detail="Chunk too large")
-    
-    # Generate job ID and queue task
-    job_id = str(uuid.uuid4())
-    background_tasks.add_task(process_leads_background, job_id, body.leads, token.get("sub"))
-    
-    # IMMEDIATE response
-    return JobResponse(
-        job_id=job_id,
-        status="received",
-        message="Queued",
-        received_count=leads_count,
-        timestamp=datetime.utcnow()
-    )
-
 @router.post("", response_model=JobResponse)
 async def create_leads(
     background_tasks: BackgroundTasks,
-    body: LeadsChunk = Body(...),
+    body: Optional[LeadsChunk] = Body(None),
     token=Depends(verify_jwt_token)
 ):
     """Queue leads for processing and return job ID immediately"""
     
-    # 1) Validate input - ONLY basic validation
-    if len(body.leads) > MAX_CHUNK_SIZE:
+    # 1) Validate payload exists
+    if body is None or not body.leads:
         raise HTTPException(
             status_code=400, 
-            detail=f"Chunk size {len(body.leads)} exceeds maximum {MAX_CHUNK_SIZE}"
+            detail="Request payload is required and must contain leads"
         )
     
-    # 2) Create job_id - FAST operation
+    # 2) Create job_id and get user_id - FAST operations
     job_id = str(uuid.uuid4())
     user_id = token.get("sub")  # Get user ID from JWT token
     
-    # 3) Queue background task - NO WAITING
+    # 3) Queue background task - NO WAITING, chunk size validation moved to background
     background_tasks.add_task(
         process_leads_background,
         job_id,
@@ -241,9 +226,8 @@ async def create_leads(
         status="received",
         message="Leads received and queued for processing",
         received_count=len(body.leads),
-        timestamp=datetime.utcnow()
+        timestamp=datetime.utcnow() 
     )
-
 @router.get("/status/{job_id}")
 async def get_job_status(
     job_id: str,
