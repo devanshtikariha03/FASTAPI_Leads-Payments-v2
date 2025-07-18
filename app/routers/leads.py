@@ -19,7 +19,7 @@ router = APIRouter(prefix="/api/v2/leads", tags=["leads"])
 
 # Configuration - ADJUSTED FOR WORST SUPABASE PLAN
 MAX_CHUNK_SIZE = 3000  # Reduced from 5000
-BATCH_SIZE = 200  # Reduced from 5000 - much smaller batches
+BATCH_SIZE = 400  # Reduced from 5000 - much smaller batches
 MAX_CONCURRENT_BACKGROUND_TASKS = 3  # Reduced from 3
 MAX_DB_CONNECTIONS = 4  # Reduced from 10 - worst plan likely has 2-5 connections
 
